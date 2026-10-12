@@ -1,0 +1,8 @@
+{
+  "name": "Remix ExamCraft AI",
+  "description": "ExamCraft AI: A Source-Grounded RAG Platform for Customizable Examination Generation from Educational Documents",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

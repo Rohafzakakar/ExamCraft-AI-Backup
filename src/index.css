@@ -1,0 +1,110 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+  
+  [dir="rtl"] {
+    font-family: 'Vazirmatn', 'Plus Jakarta Sans', system-ui, sans-serif;
+  }
+}
+
+/* Phase 4.3: Professional Academic Print Media Styles */
+@media print {
+  @page {
+    size: auto;
+    margin: 12mm 15mm;
+  }
+
+  /* Hide application navigation, buttons, tabs, banners, dialogs, and UI tools */
+  header,
+  nav,
+  footer,
+  aside,
+  button,
+  input,
+  select,
+  textarea,
+  .no-print,
+  .export-modal-backdrop,
+  [role="dialog"],
+  [aria-modal="true"] {
+    display: none !important;
+  }
+
+  /* Unconstrain document flow across pages and prevent browser flex/min-height clipping */
+  html,
+  body {
+    background: #ffffff !important;
+    background-color: #ffffff !important;
+    color: #000000 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  #root,
+  #root > div,
+  main {
+    display: block !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+  }
+
+  .print-page-break {
+    break-before: page !important;
+    page-break-before: always !important;
+  }
+
+  .paper-sheet {
+    box-shadow: none !important;
+    border: none !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+
+  .paper-sheet,
+  .paper-sheet * {
+    overflow: visible !important;
+  }
+
+  /* Keep question stems, choices, and answer lines together cleanly */
+  .paper-question-item {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+  }
+
+  /* Table pagination and row integrity */
+  table {
+    border-collapse: collapse !important;
+    width: 100% !important;
+  }
+
+  thead {
+    display: table-header-group !important;
+  }
+
+  tr {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+  }
+
+  th,
+  td {
+    word-break: break-word !important;
+    overflow-wrap: break-word !important;
+  }
+}
