@@ -21,8 +21,11 @@ import {
   Download,
   FileDown,
   Eye,
+  ChevronUp,
+  ChevronDown,
 } from 'lucide-react';
 import { AcademicPaperPreview } from './AcademicPaperPreview';
+import { authFetch } from '../utils/auth';
 
 interface DocumentInfo {
   id: string;
@@ -69,7 +72,8 @@ export interface Exam {
   id: string;
   title: string;
   subject: string;
-  institution?: string;
+  institution?: string | null;
+  faculty?: string | null;
   teacher_name?: string;
   grade_level?: string;
   exam_date?: string;
@@ -102,7 +106,19 @@ interface AnswerKeyGroup {
   items: AnswerKeyItem[];
 }
 
-export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean }) {
+export interface ExamWorkspaceProps {
+  isLlmConfigured: boolean;
+  externalActiveExamId?: string | null;
+  onOpenHistory?: () => void;
+  onExamsUpdated?: (exams: Exam[]) => void;
+}
+
+export function ExamWorkspace({
+  isLlmConfigured,
+  externalActiveExamId,
+  onOpenHistory,
+  onExamsUpdated,
+}: ExamWorkspaceProps) {
   // Step navigation: 1: Upload, 2: Configure & Generate, 3: Review & Groups
   const [step, setStep] = useState<number>(1);
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
@@ -114,6 +130,8 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
   // Exam Configuration State (Supports 1-10 groups)
   const [title, setTitle] = useState<string>('Cell Biology Midterm Examination');
   const [subject, setSubject] = useState<string>('Molecular & Cellular Biology');
+  const [institution, setInstitution] = useState<string>('');
+  const [faculty, setFaculty] = useState<string>('');
   const [groupsCount, setGroupsCount] = useState<number>(3);
   const [durationMinutes, setDurationMinutes] = useState<number>(60);
   const [mcqCount, setMcqCount] = useState<number>(2);
@@ -171,15 +189,49 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
   const [isDeletingQuestion, setIsDeletingQuestion] = useState<boolean>(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
-  // Load existing documents on mount
+  const loadExamById = async (examId: string) => {
+    try {
+      const res = await authFetch(`/api/exams/${examId}`);
+      if (res.ok) {
+        const data = await res.json();
+        setActiveExam(data);
+        setActiveGroupIndex(0);
+        setStep(3);
+        loadAnswerKeys(data.id);
+      }
+    } catch (e) {
+      console.error('Failed to load exam by id:', e);
+    }
+  };
+
+  // React to external active exam changes
+  useEffect(() => {
+    if (externalActiveExamId) {
+      loadExamById(externalActiveExamId);
+    }
+  }, [externalActiveExamId]);
+
+  // Load existing documents & exams on mount and listen to auth changes
   useEffect(() => {
     fetchDocuments();
     fetchExams();
+
+    const handleAuthChange = () => {
+      fetchDocuments();
+      fetchExams();
+    };
+
+    window.addEventListener('examcraft_auth_changed', handleAuthChange);
+    window.addEventListener('examcraft_auth_expired', handleAuthChange);
+    return () => {
+      window.removeEventListener('examcraft_auth_changed', handleAuthChange);
+      window.removeEventListener('examcraft_auth_expired', handleAuthChange);
+    };
   }, []);
 
   const fetchDocuments = async () => {
     try {
-      const res = await fetch('/api/documents');
+      const res = await authFetch('/api/documents');
       if (res.ok) {
         const data = await res.json();
         setDocuments(data);
@@ -194,10 +246,13 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
 
   const fetchExams = async () => {
     try {
-      const res = await fetch('/api/exams');
+      const res = await authFetch('/api/exams');
       if (res.ok) {
         const data = await res.json();
-        if (data.length > 0) {
+        if (onExamsUpdated) {
+          onExamsUpdated(data);
+        }
+        if (data.length > 0 && !activeExam) {
           setActiveExam(data[0]);
           loadAnswerKeys(data[0].id);
         }
@@ -209,7 +264,7 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
 
   const loadAnswerKeys = async (examId: string) => {
     try {
-      const res = await fetch(`/api/exams/${examId}/answer-key`);
+      const res = await authFetch(`/api/exams/${examId}/answer-key`);
       if (res.ok) {
         const data = await res.json();
         setAnswerKeys(data);
@@ -231,7 +286,7 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
     formData.append('session_id', 'teacher_session');
 
     try {
-      const res = await fetch('/api/documents/upload', {
+      const res = await authFetch('/api/documents/upload', {
         method: 'POST',
         body: formData,
       });
@@ -279,7 +334,8 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
       selected_pages: parsedPages,
       title: title || 'Examination',
       subject: subject || 'General Subject',
-      institution: 'Faculty of Sciences',
+      institution: institution.trim() || undefined,
+      faculty: faculty.trim() || undefined,
       teacher_name: 'Instructor',
       grade_level: 'Undergraduate',
       duration_minutes: durationMinutes,
@@ -299,7 +355,7 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
     };
 
     try {
-      const res = await fetch('/api/exams/generate', {
+      const res = await authFetch('/api/exams/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -315,6 +371,7 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
       setActiveGroupIndex(0);
       setStep(3);
       loadAnswerKeys(examData.id);
+      fetchExams();
     } catch (err: any) {
       setGenerationError(err.message || 'Generation failed');
     } finally {
@@ -322,12 +379,31 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
     }
   };
 
+  const normalizeCorrectAnswer = (correct: string, options?: string[] | null) => {
+    if (!options || options.length === 0) return correct;
+    const exact = options.find((opt) => opt === correct);
+    if (exact) return exact;
+    const letters = ['A', 'B', 'C', 'D', 'E'];
+    for (let idx = 0; idx < options.length; idx++) {
+      const l = letters[idx];
+      if (correct.trim() === l || correct.startsWith(`${l})`) || correct.startsWith(`${l}.`)) {
+        return options[idx];
+      }
+    }
+    const sub = options.find((opt) => correct.includes(opt) || opt.includes(correct));
+    if (sub) return sub;
+    return options[0] || correct;
+  };
+
   const handleStartEdit = (q: Question) => {
     setEditingQuestionId(q.id);
     setEditText(q.question_text);
     setEditMarks(q.marks);
-    setEditOptions(q.options ? [...q.options] : []);
-    setEditCorrectAnswer(q.correct_answer || '');
+    const initialOptions = q.options && q.options.length > 0
+      ? [...q.options]
+      : (q.question_type === 'mcq' ? ['Option A', 'Option B', 'Option C', 'Option D'] : []);
+    setEditOptions(initialOptions);
+    setEditCorrectAnswer(normalizeCorrectAnswer(q.correct_answer || '', initialOptions));
     setEditExplanation(q.explanation || '');
     setEditError(null);
   };
@@ -351,7 +427,7 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
         payload.correct_answer = editCorrectAnswer;
       }
 
-      const res = await fetch(`/api/exams/${activeExam.id}/questions/${questionId}`, {
+      const res = await authFetch(`/api/exams/${activeExam.id}/questions/${questionId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -359,24 +435,31 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
 
       if (res.ok) {
         const updatedQ: Question = await res.json();
-        setActiveExam((prev) => {
-          if (!prev) return prev;
-          const newGroups = prev.groups.map((g) => {
-            const hasQ = g.questions.some((q) => q.id === questionId);
-            if (hasQ) {
-              return {
-                ...g,
-                questions: g.questions.map((q) => (q.id === questionId ? updatedQ : q)),
-              };
-            }
-            return g;
+        // Fetch fresh exam state to guarantee synchronization across all groups and variants
+        const examRes = await authFetch(`/api/exams/${activeExam.id}`);
+        if (examRes.ok) {
+          const freshExam = await examRes.json();
+          setActiveExam(freshExam);
+        } else {
+          setActiveExam((prev) => {
+            if (!prev) return prev;
+            const newGroups = prev.groups.map((g) => {
+              const hasQ = g.questions.some((q) => q.id === questionId);
+              if (hasQ) {
+                return {
+                  ...g,
+                  questions: g.questions.map((q) => (q.id === questionId ? updatedQ : q)),
+                };
+              }
+              return g;
+            });
+            const newTotal = newGroups[0]?.questions.reduce((sum, q) => sum + (q.marks || 0), 0) || prev.total_marks;
+            return { ...prev, groups: newGroups, total_marks: newTotal };
           });
-          const newTotal = newGroups[0]?.questions.reduce((sum, q) => sum + (q.marks || 0), 0) || prev.total_marks;
-          return { ...prev, groups: newGroups, total_marks: newTotal };
-        });
+        }
         setEditingQuestionId(null);
         setEditError(null);
-        loadAnswerKeys(activeExam.id);
+        await loadAnswerKeys(activeExam.id);
       } else {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.detail || 'Failed to save question edits');
@@ -395,14 +478,14 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
     setDeleteError(null);
 
     try {
-      const res = await fetch(`/api/exams/${activeExam.id}/questions/${deletingQuestion.id}`, {
+      const res = await authFetch(`/api/exams/${activeExam.id}/questions/${deletingQuestion.id}`, {
         method: 'DELETE',
       });
 
       if (res.ok) {
         const data = await res.json();
         // Fetch fresh exam state from server to ensure perfect synchronization across all groups and variants
-        const examRes = await fetch(`/api/exams/${activeExam.id}`);
+        const examRes = await authFetch(`/api/exams/${activeExam.id}`);
         if (examRes.ok) {
           const freshExam = await examRes.json();
           setActiveExam(freshExam);
@@ -430,6 +513,7 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
         }
         await loadAnswerKeys(activeExam.id);
         setDeletingQuestion(null);
+        fetchExams();
       } else {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.detail || 'Failed to delete question from exam.');
@@ -654,6 +738,32 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
 
               <div>
                 <label className="block text-xs font-bold text-stone-700 mb-1">
+                  Institution / School / University <span className="text-stone-400 font-normal">(Optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={institution}
+                  onChange={(e) => setInstitution(e.target.value)}
+                  placeholder="e.g. Kabul University or High School Name"
+                  className="w-full px-3 py-2 border border-stone-200 rounded-xl text-xs focus:ring-2 focus:ring-[#9D174D]/30 focus:border-[#9D174D] outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-stone-700 mb-1">
+                  Faculty / Department <span className="text-stone-400 font-normal">(Optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={faculty}
+                  onChange={(e) => setFaculty(e.target.value)}
+                  placeholder="e.g. Faculty of Law or Department of Computer Science"
+                  className="w-full px-3 py-2 border border-stone-200 rounded-xl text-xs focus:ring-2 focus:ring-[#9D174D]/30 focus:border-[#9D174D] outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-stone-700 mb-1">
                   Source Page Range
                 </label>
                 <input
@@ -857,7 +967,14 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
                 )}
               </div>
               <p className="text-xs text-stone-500 mt-1">
-                Subject: <span className="font-semibold text-stone-700">{activeExam.subject}</span> | Total Questions: {activeExam.questions_count} | All Questions Source-Grounded
+                Subject: <span className="font-semibold text-stone-700">{activeExam.subject}</span>
+                {activeExam.institution && (
+                  <span> | Institution: <span className="font-semibold text-stone-700">{activeExam.institution}</span></span>
+                )}
+                {activeExam.faculty && (
+                  <span> | Faculty/Dept: <span className="font-semibold text-stone-700">{activeExam.faculty}</span></span>
+                )}
+                {' | Total Questions: '}{activeExam.questions_count} | All Questions Source-Grounded
               </p>
             </div>
 
@@ -992,40 +1109,44 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
                         </span>
                       </div>
 
-                      <div className="flex items-center gap-1">
+                      <div className="flex items-center gap-1.5">
                         {!isEditing ? (
-                          <div className="flex items-center gap-1">
+                          <div className="flex items-center gap-2">
                             <button
+                              type="button"
                               onClick={() => handleStartEdit(q)}
-                              className="p-1.5 text-stone-500 hover:text-stone-800 hover:bg-stone-100 rounded-lg transition-all cursor-pointer flex items-center gap-1 text-xs font-semibold"
-                              title="Edit Question, Options & Answer"
+                              className="px-2.5 py-1 text-xs font-semibold text-stone-700 bg-stone-100 hover:bg-stone-200 border border-stone-200 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 shadow-2xs"
+                              title="Edit Question, Choices, Answer & Rubric"
                             >
                               <Edit2 className="w-3.5 h-3.5 text-stone-600" />
-                              <span className="hidden sm:inline">Edit</span>
+                              <span>Edit</span>
                             </button>
                             <button
+                              type="button"
                               onClick={() => {
                                 setDeletingQuestion(q);
                                 setDeleteError(null);
                               }}
-                              className="p-1.5 text-rose-600 hover:text-rose-700 hover:bg-rose-50 rounded-lg transition-all cursor-pointer flex items-center gap-1 text-xs font-semibold"
-                              title="Delete Question from all groups"
+                              className="px-2.5 py-1 text-xs font-bold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 shadow-2xs"
+                              title="Delete Question across all groups"
                             >
-                              <Trash2 className="w-3.5 h-3.5" />
-                              <span className="hidden sm:inline">Delete</span>
+                              <Trash2 className="w-3.5 h-3.5 text-rose-600" />
+                              <span>Delete Question</span>
                             </button>
                           </div>
                         ) : (
-                          <div className="flex items-center gap-1">
+                          <div className="flex items-center gap-1.5">
                             <button
+                              type="button"
                               onClick={() => handleSaveEdit(q.id)}
                               disabled={isSavingEdit}
-                              className="px-3 py-1 bg-emerald-600 text-white text-xs font-semibold rounded-lg flex items-center gap-1 hover:bg-emerald-700 transition-all cursor-pointer shadow-2xs"
+                              className="px-3 py-1 bg-emerald-600 text-white text-xs font-semibold rounded-lg flex items-center gap-1 hover:bg-emerald-700 transition-all cursor-pointer shadow-2xs disabled:opacity-50"
                             >
                               <Save className="w-3 h-3" />
                               <span>{isSavingEdit ? 'Saving...' : 'Save'}</span>
                             </button>
                             <button
+                              type="button"
                               onClick={() => {
                                 setEditingQuestionId(null);
                                 setEditError(null);
@@ -1075,7 +1196,7 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
                           />
                         </div>
 
-                        {/* MCQ Options Editing (Supports all 4-5 options and correct answer selection) */}
+                        {/* MCQ Options Editing (Supports all 4-5 options, correct answer selection, and reordering) */}
                         {editOptions && editOptions.length > 0 && (
                           <div className="space-y-2 pt-2 border-t border-stone-100">
                             <div className="flex items-center justify-between">
@@ -1083,7 +1204,7 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
                                 Answer Choices ({editOptions.length} Options):
                               </label>
                               <span className="text-[11px] text-stone-500">
-                                Select radio button next to the choice to mark it as the correct answer.
+                                Select radio button next to choice to set as correct answer. Use arrows to reorder.
                               </span>
                             </div>
 
@@ -1091,18 +1212,15 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
                               {editOptions.map((opt, i) => {
                                 const letters = ['A', 'B', 'C', 'D', 'E'];
                                 const label = letters[i] || `${i + 1}`;
-                                const isChecked =
-                                  editCorrectAnswer === opt ||
-                                  editCorrectAnswer.startsWith(label) ||
-                                  (editCorrectAnswer.length > 0 && editCorrectAnswer.includes(opt));
+                                const isChecked = editCorrectAnswer === opt;
 
                                 return (
                                   <div
                                     key={i}
-                                    className={`p-2 rounded-xl border flex items-center gap-2.5 ${
+                                    className={`p-2.5 rounded-xl border flex items-center gap-2 transition-all ${
                                       isChecked
-                                        ? 'border-emerald-300 bg-emerald-50/60'
-                                        : 'border-stone-200 bg-stone-50/40'
+                                        ? 'border-emerald-400 bg-emerald-50/70 shadow-2xs'
+                                        : 'border-stone-200 bg-stone-50/50'
                                     }`}
                                   >
                                     <label
@@ -1114,9 +1232,15 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
                                         name={`correct_choice_${q.id}`}
                                         checked={isChecked}
                                         onChange={() => setEditCorrectAnswer(opt)}
-                                        className="accent-emerald-600 cursor-pointer"
+                                        className="accent-emerald-600 cursor-pointer w-4 h-4"
                                       />
-                                      <span className="w-5 h-5 rounded-md bg-white border border-stone-200 text-stone-700 text-[10px] font-bold flex items-center justify-center shrink-0">
+                                      <span
+                                        className={`w-6 h-6 rounded-md text-[11px] font-bold flex items-center justify-center shrink-0 border ${
+                                          isChecked
+                                            ? 'bg-emerald-600 text-white border-emerald-600'
+                                            : 'bg-white text-stone-700 border-stone-200'
+                                        }`}
+                                      >
                                         {label}
                                       </span>
                                     </label>
@@ -1127,16 +1251,61 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
                                       onChange={(e) => {
                                         const newOpts = [...editOptions];
                                         const oldVal = newOpts[i];
-                                        newOpts[i] = e.target.value;
+                                        const newVal = e.target.value;
+                                        newOpts[i] = newVal;
                                         setEditOptions(newOpts);
                                         // If this was the correct answer, keep correct answer in sync
                                         if (isChecked || editCorrectAnswer === oldVal) {
-                                          setEditCorrectAnswer(e.target.value);
+                                          setEditCorrectAnswer(newVal);
                                         }
                                       }}
-                                      className="flex-1 px-2.5 py-1 border border-stone-300 rounded-lg text-xs bg-white focus:ring-1 focus:ring-emerald-500 outline-none"
+                                      className="flex-1 px-3 py-1.5 border border-stone-300 rounded-lg text-xs bg-white focus:ring-1 focus:ring-emerald-500 outline-none"
                                       placeholder={`Option ${label}`}
                                     />
+
+                                    {/* Reorder Up and Down buttons */}
+                                    <div className="flex items-center gap-0.5 shrink-0">
+                                      <button
+                                        type="button"
+                                        disabled={i === 0}
+                                        onClick={() => {
+                                          if (i === 0) return;
+                                          const newOpts = [...editOptions];
+                                          const temp = newOpts[i];
+                                          newOpts[i] = newOpts[i - 1];
+                                          newOpts[i - 1] = temp;
+                                          setEditOptions(newOpts);
+                                        }}
+                                        className={`p-1 rounded cursor-pointer ${
+                                          i === 0
+                                            ? 'text-stone-300 cursor-not-allowed'
+                                            : 'text-stone-500 hover:text-stone-800 hover:bg-stone-200/70'
+                                        }`}
+                                        title="Move choice up"
+                                      >
+                                        <ChevronUp className="w-3.5 h-3.5" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        disabled={i === editOptions.length - 1}
+                                        onClick={() => {
+                                          if (i === editOptions.length - 1) return;
+                                          const newOpts = [...editOptions];
+                                          const temp = newOpts[i];
+                                          newOpts[i] = newOpts[i + 1];
+                                          newOpts[i + 1] = temp;
+                                          setEditOptions(newOpts);
+                                        }}
+                                        className={`p-1 rounded cursor-pointer ${
+                                          i === editOptions.length - 1
+                                            ? 'text-stone-300 cursor-not-allowed'
+                                            : 'text-stone-500 hover:text-stone-800 hover:bg-stone-200/70'
+                                        }`}
+                                        title="Move choice down"
+                                      >
+                                        <ChevronDown className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
 
                                     {editOptions.length > 2 && (
                                       <button
@@ -1148,7 +1317,7 @@ export function ExamWorkspace({ isLlmConfigured }: { isLlmConfigured: boolean })
                                             setEditCorrectAnswer(newOpts[0]);
                                           }
                                         }}
-                                        className="p-1 text-stone-400 hover:text-rose-600 rounded cursor-pointer"
+                                        className="p-1 text-stone-400 hover:text-rose-600 rounded cursor-pointer shrink-0"
                                         title="Remove option"
                                       >
                                         <X className="w-3.5 h-3.5" />

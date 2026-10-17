@@ -10,14 +10,34 @@ import {
   Layers,
   Database,
   ArrowRight,
+  User,
+  LogOut,
+  Sparkles,
 } from 'lucide-react';
 import { SecureLLMSettingsModal } from './components/SecureLLMSettingsModal';
 import { ExamWorkspace } from './components/ExamWorkspace';
+import { AuthModal } from './components/AuthModal';
+import { ExamHistoryModal, SavedExamSummary } from './components/ExamHistoryModal';
+import {
+  TeacherUser,
+  getSavedUser,
+  removeAuthToken,
+  removeSavedUser,
+  resetGuestSessionId,
+  authFetch,
+} from './utils/auth';
 
 export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLlmConfigured, setIsLlmConfigured] = useState(false);
   const [activeModel, setActiveModel] = useState('openrouter/free');
+
+  // Authentication & History States
+  const [currentUser, setCurrentUser] = useState<TeacherUser | null>(getSavedUser());
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
+  const [savedExams, setSavedExams] = useState<SavedExamSummary[]>([]);
+  const [activeExamId, setActiveExamId] = useState<string | null>(null);
 
   // Check LLM status on mount
   const checkStatus = async () => {
@@ -33,9 +53,67 @@ export default function App() {
     }
   };
 
+  // Fetch initial exams list for history modal count
+  const fetchExamsList = async () => {
+    try {
+      const res = await authFetch('/api/exams');
+      if (res.ok) {
+        const data = await res.json();
+        setSavedExams(data);
+      }
+    } catch {
+      // Backend booting
+    }
+  };
+
   useEffect(() => {
     checkStatus();
+    fetchExamsList();
+
+    const handleAuthExpired = () => {
+      setCurrentUser(null);
+      fetchExamsList();
+    };
+
+    window.addEventListener('examcraft_auth_expired', handleAuthExpired);
+    return () => {
+      window.removeEventListener('examcraft_auth_expired', handleAuthExpired);
+    };
   }, []);
+
+  const handleLogout = async () => {
+    try {
+      await authFetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // proceed with local cleanup
+    }
+    removeAuthToken();
+    removeSavedUser();
+    resetGuestSessionId();
+    setCurrentUser(null);
+    setIsAuthModalOpen(false);
+    window.dispatchEvent(new CustomEvent('examcraft_auth_changed'));
+    fetchExamsList();
+  };
+
+  const handleAuthSuccess = (user: TeacherUser) => {
+    setCurrentUser(user);
+    window.dispatchEvent(new CustomEvent('examcraft_auth_changed'));
+    fetchExamsList();
+  };
+
+  const handleSelectExamFromHistory = (examId: string) => {
+    setActiveExamId(examId);
+  };
+
+  const handleCreateNewExam = () => {
+    setActiveExamId(null);
+  };
+
+  const handleDeleteExamFromHistory = (examId: string) => {
+    setSavedExams((prev) => prev.filter((e) => e.id !== examId));
+    window.dispatchEvent(new CustomEvent('examcraft_auth_changed'));
+  };
 
   return (
     <div className="min-h-screen bg-[#FAF9F6] text-[#1F1924] flex flex-col">
@@ -49,7 +127,7 @@ export default function App() {
             <div className="flex items-center gap-2">
               <span className="font-bold text-lg tracking-tight text-[#9D174D]">ExamCraft AI</span>
               <span className="text-[10px] uppercase font-bold tracking-widest px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
-                Phase 3 Verified
+                Phase 1 Verified
               </span>
             </div>
             <p className="text-xs text-stone-500 font-medium">
@@ -58,8 +136,21 @@ export default function App() {
           </div>
         </div>
 
-        {/* Header Action: Secure LLM Settings Button */}
+        {/* Header Actions */}
         <div className="flex items-center gap-3">
+          {/* Exam History Button */}
+          <button
+            onClick={() => setIsHistoryModalOpen(true)}
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-pink-200 bg-pink-50/80 hover:bg-pink-100 text-[#9D174D] text-xs font-bold transition-all shadow-2xs cursor-pointer"
+          >
+            <BookOpen className="w-3.5 h-3.5" />
+            <span>Exam History</span>
+            <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-[#9D174D] text-white font-bold">
+              {savedExams.length}
+            </span>
+          </button>
+
+          {/* Secure LLM Settings Button */}
           <button
             onClick={() => setIsSettingsOpen(true)}
             className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl border text-xs font-semibold transition-all shadow-xs cursor-pointer ${
@@ -83,6 +174,44 @@ export default function App() {
               {isLlmConfigured ? 'OpenRouter: Configured' : 'Configure OpenRouter Key'}
             </span>
           </button>
+
+          {/* Teacher Auth / Guest Status Indicator */}
+          {currentUser ? (
+            <div className="flex items-center gap-2 pl-2 border-l border-stone-200">
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-stone-100 border border-stone-200/80 text-stone-800 text-xs font-semibold">
+                <div className="w-5 h-5 rounded-full bg-[#9D174D] text-white flex items-center justify-center font-bold text-[10px]">
+                  {currentUser.full_name.charAt(0).toUpperCase()}
+                </div>
+                <div className="text-left hidden sm:block">
+                  <div className="leading-tight font-bold">{currentUser.full_name}</div>
+                  <div className="text-[10px] text-stone-500 font-normal truncate max-w-[120px]">
+                    {currentUser.institution || 'Teacher'}
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={handleLogout}
+                title="Log Out"
+                className="p-1.5 rounded-xl border border-stone-200 hover:bg-rose-50 text-stone-500 hover:text-rose-600 transition-colors cursor-pointer"
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 pl-2 border-l border-stone-200">
+              <div className="px-2.5 py-1 rounded-xl bg-stone-100 text-stone-600 text-xs font-medium hidden sm:flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-stone-400" />
+                <span>Guest Mode</span>
+              </div>
+              <button
+                onClick={() => setIsAuthModalOpen(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#9D174D] hover:bg-[#83133E] text-white text-xs font-bold transition-all shadow-xs cursor-pointer"
+              >
+                <User className="w-3.5 h-3.5" />
+                <span>Sign In / Register</span>
+              </button>
+            </div>
+          )}
         </div>
       </header>
 
@@ -116,7 +245,7 @@ export default function App() {
                   <h2 className="text-base font-bold text-stone-900">
                     {isLlmConfigured
                       ? 'OpenRouter LLM Ready in Server Memory'
-                      : 'OpenRouter Credential Required for Phase 3'}
+                      : 'OpenRouter Credential Required'}
                   </h2>
                   <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-white/90 border border-stone-200 text-stone-700">
                     Model: {activeModel}
@@ -124,7 +253,7 @@ export default function App() {
                 </div>
                 <p className="text-xs text-stone-600 max-w-2xl leading-relaxed">
                   {isLlmConfigured
-                    ? 'Your API key is securely held in FastAPI server RAM. It is never stored in browser storage, never written to disk or database, and never committed to source files.'
+                    ? 'Your API key is securely held in server RAM. It is never stored in browser storage, never written to disk or database, and never committed to source files.'
                     : 'To enable automated question generation, enter your OpenRouter key into the secure password-masked modal. Keys are transmitted over HTTPS directly to server memory only.'}
                 </p>
               </div>
@@ -141,70 +270,72 @@ export default function App() {
           </div>
         </div>
 
-        {/* Phase 3 Active Educator Examination Workspace */}
-        <ExamWorkspace isLlmConfigured={isLlmConfigured} />
+        {/* Active Educator Examination Workspace */}
+        <ExamWorkspace
+          isLlmConfigured={isLlmConfigured}
+          externalActiveExamId={activeExamId}
+          onOpenHistory={() => setIsHistoryModalOpen(true)}
+          onExamsUpdated={(exams) => setSavedExams(exams as any)}
+        />
 
-        {/* Phase 1, 2 & 3 Completed Verification Overview */}
+        {/* Phase 1 Verification Overview & Persistence Architecture */}
         <div className="no-print space-y-4">
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-bold text-stone-900 tracking-tight flex items-center gap-2">
               <Layers className="w-4 h-4 text-[#9D174D]" />
-              System Architecture Status
+              Phase 1 Authentication & Persistence Architecture
             </h3>
             <span className="text-xs text-emerald-700 font-semibold bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200 flex items-center gap-1.5">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-              23 / 23 Automated Backend Tests Passing
+              SQLite Persistent Database Active
             </span>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             {/* Database & Persistence */}
             <div className="p-5 bg-white rounded-2xl border border-stone-200/80 shadow-xs space-y-2">
-              <div className="w-8 h-8 rounded-lg bg-stone-100 text-stone-700 flex items-center justify-center mb-1">
+              <div className="w-8 h-8 rounded-lg bg-pink-50 text-[#9D174D] flex items-center justify-center mb-1">
                 <Database className="w-4 h-4" />
               </div>
-              <h4 className="text-xs font-bold text-stone-900">Zero-Config SQLite Async</h4>
+              <h4 className="text-xs font-bold text-stone-900">Node 22 Built-in SQLite</h4>
               <p className="text-[11px] text-stone-500 leading-relaxed">
-                Active async SQLite database engine. Fully isolated, zero external credentials or
-                host configurations required.
+                Relational SQLite engine with WAL mode and automated rolling backups. Preserves all exams, documents, groups, and questions across server restarts.
               </p>
               <div className="pt-2">
                 <span className="text-[10px] font-mono font-medium text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                  sqlite+aiosqlite: OK
+                  data/examcraft.db: WAL Mode
                 </span>
               </div>
             </div>
 
-            {/* Document Processing & Parsing */}
+            {/* Authentication & Guest Isolation */}
             <div className="p-5 bg-white rounded-2xl border border-stone-200/80 shadow-xs space-y-2">
-              <div className="w-8 h-8 rounded-lg bg-pink-50 text-[#9D174D] flex items-center justify-center mb-1">
-                <FileText className="w-4 h-4" />
+              <div className="w-8 h-8 rounded-lg bg-emerald-50 text-emerald-700 flex items-center justify-center mb-1">
+                <ShieldCheck className="w-4 h-4" />
               </div>
-              <h4 className="text-xs font-bold text-stone-900">Document Parsing & Validation</h4>
+              <h4 className="text-xs font-bold text-stone-900">Teacher Auth & Guest Isolation</h4>
               <p className="text-[11px] text-stone-500 leading-relaxed">
-                PyMuPDF (fitz) and python-docx parsers with automatic Arabic/Dari/Pashto/Urdu RTL
-                script detection and heading extraction.
+                scryptSync password hashing with 16-byte random salts. Isolated guest sessions with explicit consent opt-in when migrating to a registered account.
               </p>
               <div className="pt-2">
                 <span className="text-[10px] font-mono font-medium text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                  PDF & DOCX Parsers: Verified
+                  HMAC-SHA256 Bearer: 7d TTL
                 </span>
               </div>
             </div>
 
-            {/* Metadata & Vector RAG */}
+            {/* Multi-Group Archiving */}
             <div className="p-5 bg-white rounded-2xl border border-stone-200/80 shadow-xs space-y-2">
               <div className="w-8 h-8 rounded-lg bg-purple-50 text-purple-700 flex items-center justify-center mb-1">
                 <BookOpen className="w-4 h-4" />
               </div>
-              <h4 className="text-xs font-bold text-stone-900">Metadata-Preserving RAG</h4>
+              <h4 className="text-xs font-bold text-stone-900">Archive & History Drawer</h4>
               <p className="text-[11px] text-stone-500 leading-relaxed">
-                Sliding-window chunking (350-400 tokens) strictly binding page and chapter
-                provenance to every retrieved context snippet.
+                Full examination history with instant workspace switching, question counts, marks, and direct Word (DOCX) and PDF export triggers.
               </p>
               <div className="pt-2">
                 <span className="text-[10px] font-mono font-medium text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                  Vector Store: Active
+                  Archive UI: Operational
                 </span>
               </div>
             </div>
@@ -217,6 +348,24 @@ export default function App() {
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
         onStatusChange={(configured) => setIsLlmConfigured(configured)}
+      />
+
+      {/* Teacher Authentication Modal */}
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => setIsAuthModalOpen(false)}
+        onSuccess={handleAuthSuccess}
+      />
+
+      {/* Exam History Modal */}
+      <ExamHistoryModal
+        isOpen={isHistoryModalOpen}
+        onClose={() => setIsHistoryModalOpen(false)}
+        exams={savedExams}
+        activeExamId={activeExamId}
+        onSelectExam={handleSelectExamFromHistory}
+        onCreateNewExam={handleCreateNewExam}
+        onDeleteExam={handleDeleteExamFromHistory}
       />
     </div>
   );

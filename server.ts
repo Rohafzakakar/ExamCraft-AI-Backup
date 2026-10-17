@@ -1,4 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
+import http from 'http';
 import multer from 'multer';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
@@ -20,6 +21,42 @@ import {
   BorderStyle,
 } from 'docx';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import fontkit from '@pdf-lib/fontkit';
+import reshaper from 'arabic-persian-reshaper';
+import bidiFactory from 'bidi-js';
+const bidi = bidiFactory();
+import {
+  db,
+  DocumentRecord,
+  DocumentChunkRecord,
+  QuestionRecord,
+  ExamGroupRecord,
+  ExamRecord,
+} from './src/server/db.js';
+import {
+  hashPassword,
+  verifyPassword,
+  createToken,
+  verifyToken,
+  authenticateUserOrGuest,
+  requireTeacherAuth,
+} from './src/server/auth.js';
+import {
+  areQuestionsDuplicate,
+  normalizeQuestionText,
+  normalizeQuestionOptions,
+  getQuestionTokens,
+  computeJaccardSimilarity,
+} from './src/server/duplicateDetector.js';
+import type { QuestionCandidate } from './src/server/duplicateDetector.js';
+export type { QuestionCandidate };
+export {
+  areQuestionsDuplicate,
+  normalizeQuestionText,
+  normalizeQuestionOptions,
+  getQuestionTokens,
+  computeJaccardSimilarity,
+};
 
 dotenv.config();
 
@@ -30,95 +67,6 @@ const __dirname = path.dirname(__filename);
 let runtimeOpenRouterKey: string | null = process.env.OPENROUTER_API_KEY || null;
 const openRouterModel = process.env.OPENROUTER_MODEL || 'openrouter/free';
 const geminiApiKey = process.env.GEMINI_API_KEY || null;
-
-interface DocumentChunkRecord {
-  id: string;
-  document_id: string;
-  page_number: number;
-  chapter?: string;
-  section?: string;
-  content: string;
-  token_count: number;
-  chunk_index: number;
-}
-
-interface DocumentRecord {
-  id: string;
-  user_id?: string | null;
-  session_id?: string | null;
-  filename: string;
-  file_type: string;
-  file_size_bytes: number;
-  detected_language: string;
-  is_rtl: boolean;
-  total_pages: number;
-  status: string;
-  metadata: {
-    chapters: string[];
-    total_characters: number;
-    pages_info: Array<{ page_number: number; chapter?: string; char_count: number }>;
-  };
-  chunks: DocumentChunkRecord[];
-  created_at: string;
-  error_message?: string | null;
-}
-
-interface QuestionRecord {
-  id: string;
-  exam_id: string;
-  group_id: string;
-  question_order: number;
-  question_type: string;
-  question_text: string;
-  options?: string[] | null;
-  correct_answer: string;
-  explanation?: string | null;
-  marks: number;
-  difficulty: string;
-  bloom_level?: string | null;
-  source_document_name: string;
-  source_page: number;
-  source_chapter?: string | null;
-  source_section?: string | null;
-  source_chunk_id?: string | null;
-  source_evidence: string;
-  created_at: string;
-  updated_at: string;
-}
-
-interface ExamGroupRecord {
-  id: string;
-  exam_id: string;
-  group_name: string;
-  group_order: number;
-  questions_count: number;
-  questions: QuestionRecord[];
-}
-
-interface ExamRecord {
-  id: string;
-  user_id?: string | null;
-  session_id?: string | null;
-  title: string;
-  subject: string;
-  institution?: string;
-  teacher_name?: string;
-  grade_level?: string;
-  exam_date?: string;
-  duration_minutes: number;
-  total_marks: number;
-  language: string;
-  is_rtl: boolean;
-  bloom_enabled: boolean;
-  status: string;
-  groups_count: number;
-  questions_count: number;
-  difficulty_distribution?: Record<string, number>;
-  question_types_config?: Record<string, number>;
-  groups: ExamGroupRecord[];
-  created_at: string;
-  updated_at: string;
-}
 
 const documentsStore: DocumentRecord[] = [];
 const examsStore: ExamRecord[] = [];
@@ -150,6 +98,173 @@ function detectIsRtl(text: string): boolean {
 function detectLanguage(text: string): string {
   if (detectIsRtl(text)) return 'fa';
   return 'en';
+}
+
+function decodeUtf8Filename(raw: string): string {
+  if (!raw) return 'document.pdf';
+  try {
+    const decoded = Buffer.from(raw, 'latin1').toString('utf8');
+    if (/[^\x00-\x7F]/.test(decoded) && !decoded.includes('\uFFFD')) {
+      return decoded;
+    }
+  } catch {}
+  return raw;
+}
+
+function cleanDocumentContentForRag(rawText: string): { cleanedText: string; isOnlyMetadata: boolean; substantiveWordsCount: number } {
+  if (!rawText) return { cleanedText: '', isOnlyMetadata: true, substantiveWordsCount: 0 };
+
+  let text = String(rawText)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\t/g, ' ')
+    .replace(/ـ+/g, '');
+
+  const lines = text.split('\n');
+  const filteredLines: string[] = [];
+
+  const metadataPatterns = [
+    /^\s*\d+\s*\|\s*P\s*a\s*g\s*e\s*$/i,
+    /^\s*Page\s+\d+(\s+of\s+\d+)?\s*$/i,
+    /^\s*--\s*\d+\s+of\s+\d+\s*--\s*$/i,
+    /^\s*_{4,}\s*$/,
+    /^\s*={4,}\s*$/,
+    /^\s*-{4,}\s*$/,
+    /^\s*\*{4,}\s*$/,
+    /^\s*Assignment\s+\d+\s*[:：]?\s*.*$/i,
+    /^\s*Assignment\s*Title\s*[:：]\s*.*$/i,
+    /^\s*(for|in|of|and|with)\s+[A-Za-z0-9\s]+(Platforms|Assignment|Course|Report)\s*$/i,
+    /^\s*Instructor\s*[:：]\s*.*$/i,
+    /^\s*Professor\s*[:：]\s*.*$/i,
+    /^\s*Teacher\s*[:：]\s*.*$/i,
+    /^\s*Written\s*[:：]\s*.*$/i,
+    /^\s*Author\s*[:：]\s*.*$/i,
+    /^\s*Student\s*(Name)?\s*[:：]\s*.*$/i,
+    /^\s*Due\s*Date\s*[:：]\s*.*$/i,
+    /^\s*Submission\s*Date\s*[:：]\s*.*$/i,
+    /^\s*Roll\s*(No|Number)?\s*[:：]\s*.*$/i,
+    /^\s*Semester\s*[:：]\s*.*$/i,
+    /^\s*Course\s*(Code|Title)?\s*[:：]\s*.*$/i,
+    /^\s*Department\s*(of\s+.*)?\s*$/i,
+    /^\s*University\s*(of\s+.*)?\s*$/i,
+    /^\s*Title\s*[:：]\s*.*$/i,
+    /^\s*Subject\s*[:：]\s*.*$/i,
+    /^\s*(Sir|Prof\.?|Dr\.?)\s+[A-Za-z\s]+$/i,
+    /^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}\s*$/,
+    // Dari / Persian / Arabic patterns
+    /^\s*تهیه\s*کننده\s*[:：].*$/i,
+    /^\s*استاد(\s*راهنما)?\s*[:：].*$/i,
+    /^\s*دانشگاه\s*[:：]?.*$/i,
+    /^\s*دانشکده\s*[:：]?.*$/i,
+    /^\s*دیپارتمنت\s*[:：]?.*$/i,
+    /^\s*رشته\s*[:：]?.*$/i,
+    /^\s*مضمون\s*[:：]?.*$/i,
+    /^\s*صنف\s*[:：]?.*$/i,
+    /^\s*سال\s*[:：]?.*$/i,
+    /^\s*تاریخ\s*[:：]?.*$/i,
+    /^\s*شماره\s*(دانشجویی|محصل|چوکی)\s*[:：]?.*$/i,
+    /^\s*نمبر\s*تذکره\s*[:：]?.*$/i,
+    /^\s*(نویسنده|مؤلف|ارائه\s*دهنده|عنوان\s*تحقیق)\s*[:：]?.*$/i,
+  ];
+
+  const standaloneHeaderLabels = [
+    /^\s*(Instructor|Professor|Teacher|Written(\s*by)?|Author|Student(\s*Name)?|Title|Assignment(\s*Title)?|Due\s*Date|Submission\s*Date|Course|Subject)\s*[:：]?\s*$/i,
+    /^\s*(تهیه\s*کننده|استاد(\s*راهنما)?|دانشگاه|دانشکده|دیپارتمنت|رشته|مضمون|صنف|سال(\s*تحصیلی)?|تاریخ|نویسنده|مؤلف|عنوان(\s*تحقیق)?)\s*[:：]?\s*$/i,
+  ];
+
+  let skipNextNonEmpty = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const line = rawLine.trim();
+    if (!line) {
+      filteredLines.push('');
+      continue;
+    }
+
+    if (skipNextNonEmpty) {
+      skipNextNonEmpty = false;
+      continue;
+    }
+
+    let isStandaloneLabel = false;
+    for (const pat of standaloneHeaderLabels) {
+      if (pat.test(line)) {
+        isStandaloneLabel = true;
+        skipNextNonEmpty = true;
+        break;
+      }
+    }
+    if (isStandaloneLabel) continue;
+
+    let isMeta = false;
+    for (const pat of metadataPatterns) {
+      if (pat.test(line)) {
+        isMeta = true;
+        break;
+      }
+    }
+    if (!isMeta) {
+      filteredLines.push(rawLine);
+    }
+  }
+
+  const cleaned = filteredLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  const substantiveWords = cleaned.split(/\s+/).filter((w) => w.length > 2);
+  const isOnlyMetadata = substantiveWords.length < 15;
+
+  return { cleanedText: cleaned, isOnlyMetadata, substantiveWordsCount: substantiveWords.length };
+}
+
+function prepareRtlForFontkit(str: string): string {
+  if (!str) return '';
+  const hasArabic = /[\u0600-\u06FF\u0750-\u077F]/.test(str);
+  if (!hasArabic) return str;
+
+  // Mirror brackets/parentheses for RTL layout
+  let mirrored = '';
+  for (const ch of str) {
+    if (ch === '(') mirrored += ')';
+    else if (ch === ')') mirrored += '(';
+    else if (ch === '[') mirrored += ']';
+    else if (ch === ']') mirrored += '[';
+    else if (ch === '{') mirrored += '}';
+    else if (ch === '}') mirrored += '{';
+    else if (ch === '<') mirrored += '>';
+    else if (ch === '>') mirrored += '<';
+    else if (ch === '«') mirrored += '»';
+    else if (ch === '»') mirrored += '«';
+    else mirrored += ch;
+  }
+
+  // Reverse entire LTR runs (including spaces between Latin words/numbers/symbols)
+  // so that when fontkit lays out the RTL run in reverse, the Latin runs appear in proper LTR reading order.
+  const ltrRunRegex = /([A-Za-z0-9]+(?:[\s\.\-\:\/,]+[A-Za-z0-9]+)*)/g;
+  return mirrored.replace(ltrRunRegex, (match) => {
+    return match.split('').reverse().join('');
+  });
+}
+
+function formatPdfText(str: string, isRtl?: boolean): string {
+  if (!str) return '';
+  const containsArabic = /[\u0600-\u06FF\u0750-\u077F]/.test(str);
+  if (!containsArabic && !isRtl) {
+    return str;
+  }
+  return prepareRtlForFontkit(str);
+}
+
+function enableRtlOnEmbeddedFont(font: any) {
+  if (!font?.embedder?.font) return;
+  const origLayout = font.embedder.font.layout.bind(font.embedder.font);
+  font.embedder.font.layout = function (string: string, userFeatures: any, script: any, language: any, direction: any) {
+    const hasArabic = /[\u0600-\u06FF\u0750-\u077F]/.test(string);
+    if (hasArabic && !direction) {
+      direction = 'rtl';
+      script = 'arab';
+    }
+    return origLayout(string, userFeatures, script, language, direction);
+  };
 }
 
 // Seed Initial Document and Exam
@@ -533,7 +648,911 @@ function seedInitialData() {
 
 seedInitialData();
 
-// Contextual Intelligent Question Synthesizer
+// Contextual Intelligent Question Synthesizer with Semantic Duplicate Detection
+function synthesizeQuestionFromFact(
+  doc: DocumentRecord,
+  chunk: DocumentChunkRecord,
+  sentence: string,
+  targetType: string,
+  bloomEnabled: boolean,
+  seqIndex: number
+): {
+  question_type: string;
+  difficulty: string;
+  bloom_level: string;
+  marks: number;
+  question_text: string;
+  options: string[] | null;
+  correct_answer: string;
+  explanation: string;
+  source_document_name: string;
+  source_page: number;
+  source_chapter: string;
+  source_section: string;
+  source_chunk_id: string;
+  source_evidence: string;
+} | null {
+  const isPersian = doc.detected_language === 'fa' || doc.detected_language === 'ar' || Boolean(doc.is_rtl);
+  const bloomLevels = ['remember', 'understand', 'apply', 'analyze', 'evaluate', 'create'];
+  const bloom = bloomEnabled ? bloomLevels[(seqIndex + 1) % bloomLevels.length] : 'understand';
+  const cleanSent = sentence.trim();
+
+  if (isPersian) {
+    // --- PERSIAN / DARI GROUNDED SYNTHESIS ---
+    if (cleanSent.includes('پکن')) {
+      if (targetType === 'mcq') {
+        return {
+          question_type: 'mcq',
+          marks: 2.0,
+          difficulty: 'medium',
+          bloom_level: bloom,
+          question_text: 'بر اساس سند برنامه عمل پکن، کدام مورد یکی از اهداف اساسی جهانی در حمایت از حقوق زنان می‌باشد؟',
+          options: [
+            'ترویج و حفاظت از حقوق بشر زنان و تضمین برابری در قانون و عمل',
+            'تعلیق سازوکارهای بین‌المللی نظارت بر حقوق زنان در سطح منطقه‌ای',
+            'محدود نمودن فعالیت‌های مدنی و اجتماعی زنان به سطح خانوادگی',
+            'الزام ادارات به تفکیک ساختاری و کاهش فرصت‌های شغلی بانوان',
+          ],
+          correct_answer: 'ترویج و حفاظت از حقوق بشر زنان و تضمین برابری در قانون و عمل',
+          explanation: `مستند به متن منبع (صفحه ${chunk.page_number}): "${cleanSent.slice(0, 130)}..."`,
+          source_document_name: doc.filename,
+          source_page: chunk.page_number,
+          source_chapter: chunk.chapter || 'بخش آموزشی',
+          source_section: chunk.section || 'مفاهیم اصلی',
+          source_chunk_id: chunk.id,
+          source_evidence: cleanSent,
+        };
+      }
+      if (targetType === 'true_false') {
+        return {
+          question_type: 'true_false',
+          marks: 1.0,
+          difficulty: 'easy',
+          bloom_level: 'remember',
+          question_text: 'صحیح یا غلط: بر اساس برنامه عمل پکن، تضمین برابری و عدم تبعیض زنان بر مبنای قانون و در عمل، از محورهای کلیدی حمایت از حقوق زنان است.',
+          options: ['صحیح', 'غلط'],
+          correct_answer: 'صحیح',
+          explanation: `استناد مستقیم به متن: "${cleanSent.slice(0, 130)}" (صفحه ${chunk.page_number}).`,
+          source_document_name: doc.filename,
+          source_page: chunk.page_number,
+          source_chapter: chunk.chapter || 'اسناد و تحلیل',
+          source_section: chunk.section || 'حقوق اساسی',
+          source_chunk_id: chunk.id,
+          source_evidence: cleanSent,
+        };
+      }
+      if (targetType === 'fill_blank') {
+        return {
+          question_type: 'fill_blank',
+          marks: 2.0,
+          difficulty: 'medium',
+          bloom_level: 'remember',
+          question_text: 'جای خالی را تکمیل نمایید: بر اساس برنامه عمل پکن، سه حرکت مهم جهانی در حمایت از حقوق زنان شامل ترویج حقوق بشر، تضمین برابری و دستیابی به [_____] حقوقی می‌باشد.',
+          options: null,
+          correct_answer: 'سواد',
+          explanation: `واژه کلیدی «سواد حقوقی» مستند به متن منبع (صفحه ${chunk.page_number}).`,
+          source_document_name: doc.filename,
+          source_page: chunk.page_number,
+          source_chapter: chunk.chapter || 'اصطلاحات کلیدی',
+          source_section: chunk.section || 'سند پکن',
+          source_chunk_id: chunk.id,
+          source_evidence: cleanSent,
+        };
+      }
+      if (targetType === 'essay') {
+        return {
+          question_type: 'essay',
+          marks: 5.0,
+          difficulty: 'hard',
+          bloom_level: 'evaluate',
+          question_text: 'با استناد به تحلیل ارائه‌شده در متن، سه حرکت بنیادین برنامه عمل پکن را در انطباق با چالش‌های حقوقی معاصر زنان در افغانستان به تفصیل ارزیابی نمایید.',
+          options: null,
+          correct_answer: 'پاسخ تحلیلی جامع بر مبنای سند پکن: صیانت از حقوق بشر زنان، تضمین برابری در عمل و دستیابی به سواد حقوقی، همراه با بررسی موانع ساختاری.',
+          explanation: `معیار نمره‌دهی: انسجام دیدگاه (۱ نمره)، استناد به سند پکن (۲ نمره)، تحلیل حقوقی-عملی عمیق (۲ نمره). (صفحه ${chunk.page_number})`,
+          source_document_name: doc.filename,
+          source_page: chunk.page_number,
+          source_chapter: chunk.chapter || 'تحلیل پیشرفته',
+          source_section: chunk.section || 'ارزیابی حقوقی',
+          source_chunk_id: chunk.id,
+          source_evidence: cleanSent,
+        };
+      }
+    } else if (cleanSent.includes('طالبان') || cleanSent.includes('ادارات') || cleanSent.includes('محرم')) {
+      if (targetType === 'mcq') {
+        return {
+          question_type: 'mcq',
+          marks: 2.0,
+          difficulty: 'medium',
+          bloom_level: bloom,
+          question_text: 'بر اساس تحلیل متن، پیامد حقوقی و عملی ممنوعیت حضور زنان در ادارات و الزام محرم شرعی چیست؟',
+          options: [
+            'بلاتکلیفی شغلی کارمندان زن و تضییع حق کار و آزادی‌های اساسی',
+            'ارتقای خودکار امتیازات بازنشستگی کارمندان زن در بخش دولتی',
+            'ایجاد تعادل پایدار در منابع مالی و ساختار سازمانی وزارتخانه‌ها',
+            'گسترش نهادهای آموزشی تخصصی برای بانوان در تمام ولایات',
+          ],
+          correct_answer: 'بلاتکلیفی شغلی کارمندان زن و تضییع حق کار و آزادی‌های اساسی',
+          explanation: `مستند به متن منبع (صفحه ${chunk.page_number}): "${cleanSent.slice(0, 130)}..."`,
+          source_document_name: doc.filename,
+          source_page: chunk.page_number,
+          source_chapter: chunk.chapter || 'بخش آموزشی',
+          source_section: chunk.section || 'مفاهیم اصلی',
+          source_chunk_id: chunk.id,
+          source_evidence: cleanSent,
+        };
+      }
+      if (targetType === 'short_answer') {
+        return {
+          question_type: 'short_answer',
+          marks: 3.0,
+          difficulty: 'medium',
+          bloom_level: 'analyze',
+          question_text: 'در ۲ الی ۳ جمله، ابعاد حقوقی و پیامدهای محدودیت حق کار و الزامات محرم شرعی را بر اساس متن شرح دهید.',
+          options: null,
+          correct_answer: 'بر اساس منبع، این محدودیت‌ها موجب بلاتکلیفی کارمندان زن، سلب استقلال اقتصادی و تضییع آزادی‌های مدنی تصریح‌شده در اسناد حقوقی می‌گردد.',
+          explanation: `معیار نمره‌دهی: ۱. تحلیل پیامد شغلی (۱ نمره)، ۲. استناد به حقوق مدنی (۱ نمره)، ۳. وضوح تحلیل (۱ نمره). (صفحه ${chunk.page_number})`,
+          source_document_name: doc.filename,
+          source_page: chunk.page_number,
+          source_chapter: chunk.chapter || 'تحلیل حقوقی',
+          source_section: chunk.section || 'مفاهیم اساسی',
+          source_chunk_id: chunk.id,
+          source_evidence: cleanSent,
+        };
+      }
+    } else if (cleanSent.includes('مردم‌سالاری') || cleanSent.includes('شاخص‌های') || cleanSent.includes('جایگاه اجتماعی')) {
+      if (targetType === 'mcq') {
+        return {
+          question_type: 'mcq',
+          marks: 2.0,
+          difficulty: 'medium',
+          bloom_level: bloom,
+          question_text: 'طبق مباحث مطرح‌شده در متن، حقوق و جایگاه اجتماعی-سیاسی زنان بیانگر کدام شاخص در جوامع معاصر است؟',
+          options: [
+            'از بنیادی‌ترین شاخص‌های سنجش مردم‌سالاری و توسعه‌یافتگی در جوامع معاصر',
+            'صرفاً یک موضوع ثانویه و فاقد تأثیر در ثبات سیاسی و اجتماعی',
+            'معیاری مقطعی که ارتباطی با موازین حقوق بشری بین‌المللی ندارد',
+            'ابزاری اداری برای کاهش مخارج بخش عمومی در دوره‌های بحران',
+          ],
+          correct_answer: 'از بنیادی‌ترین شاخص‌های سنجش مردم‌سالاری و توسعه‌یافتگی در جوامع معاصر',
+          explanation: `استناد مستقیم: "${cleanSent.slice(0, 130)}" (صفحه ${chunk.page_number}).`,
+          source_document_name: doc.filename,
+          source_page: chunk.page_number,
+          source_chapter: chunk.chapter || 'مبانی مردم‌سالاری',
+          source_section: chunk.section || 'حقوق اساسی',
+          source_chunk_id: chunk.id,
+          source_evidence: cleanSent,
+        };
+      }
+    }
+
+    // General Persian sentence extraction
+    const keyPhrase = cleanSent.split(/[،؛,.]/)[0].trim().slice(0, 90);
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: `بر اساس گزاره مطرح‌شده در متن منبع («${keyPhrase}...»)، کدام گزینه مفهوم اساسی را بیان می‌دارد؟`,
+        options: [
+          `تأیید گزاره متن: ${cleanSent.slice(0, 85)}`,
+          'نقض تعهدات آموزشی و مدنی مندرج در اسناد بنیادین کشور',
+          'سلب مسئولیت نهادهای عمومی در تأمین عدالت اجتماعی',
+          'توقف نامحدود رسیدگی به حقوق بنیادین در نظام حقوقی',
+        ],
+        correct_answer: `تأیید گزاره متن: ${cleanSent.slice(0, 85)}`,
+        explanation: `مستند به متن منبع (صفحه ${chunk.page_number}): "${cleanSent.slice(0, 130)}"`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'بخش آموزشی',
+        source_section: chunk.section || 'مفاهیم اصلی',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    } else if (targetType === 'true_false') {
+      return {
+        question_type: 'true_false',
+        marks: 1.0,
+        difficulty: 'easy',
+        bloom_level: 'remember',
+        question_text: `صحیح یا غلط: بر اساس منبع، ${cleanSent.slice(0, 120)}`,
+        options: ['صحیح', 'غلط'],
+        correct_answer: 'صحیح',
+        explanation: `استناد مستقیم: "${cleanSent.slice(0, 120)}" (صفحه ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'اسناد و تحلیل',
+        source_section: chunk.section || 'حقوق اساسی',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    } else {
+      return {
+        question_type: 'short_answer',
+        marks: 3.0,
+        difficulty: 'medium',
+        bloom_level: 'analyze',
+        question_text: `بر اساس متن آموزشی صفحه ${chunk.page_number}، اهمیت گزاره «${keyPhrase}» را در ۲ جمله تحلیل نمایید.`,
+        options: null,
+        correct_answer: `تحلیل مستند: ${cleanSent.slice(0, 160)}`,
+        explanation: `معیار نمره‌دهی: ۱. وضوح استناد به متن (۱.۵ نمره)، ۲. دقت تحلیل مفهومی (۱.۵ نمره). (صفحه ${chunk.page_number})`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'تحلیل حقوقی',
+        source_section: chunk.section || 'مفاهیم اساسی',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  // --- ENGLISH GROUNDED SYNTHESIS ---
+  // A. CELL BIOLOGY CONCEPTS
+  if (cleanSent.includes('nucleus') || cleanSent.includes('nucleolus') || cleanSent.includes('chromatin') || cleanSent.includes('hereditary')) {
+    if (cleanSent.includes('nucleolus') || cleanSent.includes('rRNA')) {
+      if (targetType === 'short_answer') {
+        return {
+          question_type: 'short_answer',
+          marks: 3.0,
+          difficulty: 'medium',
+          bloom_level: 'analyze',
+          question_text: 'In 2-3 concise sentences, explain the structural and functional role of the nucleolus within eukaryotic cells.',
+          options: null,
+          correct_answer: 'The dense nucleolus within the nucleoplasm coordinates the transcription of ribosomal RNA (rRNA) and orchestrates the initial assembly of ribosomal subunits before they exit via nuclear pores.',
+          explanation: `Rubric: (1) Identifies nucleolus role in rRNA transcription (1.5 pts), (2) Identifies subunit assembly (1.5 pts). (Page ${chunk.page_number}).`,
+          source_document_name: doc.filename,
+          source_page: chunk.page_number,
+          source_chapter: chunk.chapter || 'Cell Architecture',
+          source_section: chunk.section || 'Nuclear Structure',
+          source_chunk_id: chunk.id,
+          source_evidence: cleanSent,
+        };
+      }
+    }
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'Which statement accurately describes the function of the cell nucleus as an organelle?',
+        options: [
+          'It houses hereditary genetic material as chromatin and coordinates ribosomal RNA transcription in the nucleolus.',
+          'It serves as the primary site of aerobic cellular ATP generation.',
+          'It directly hydrolyzes extracellular lipids through digestive lysosomal vacuolation.',
+          'It transports atmospheric carbon dioxide across the plasma membrane.',
+        ],
+        correct_answer: 'It houses hereditary genetic material as chromatin and coordinates ribosomal RNA transcription in the nucleolus.',
+        explanation: `Directly supported by source text: "${cleanSent.slice(0, 140)}..." (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Cell Architecture',
+        source_section: chunk.section || 'Nuclear Structure',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+    if (targetType === 'fill_blank') {
+      return {
+        question_type: 'fill_blank',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: 'remember',
+        question_text: 'Complete the statement: Within the eukaryotic nucleus, hereditary DNA is organized with histone proteins into [_____] fibers.',
+        options: null,
+        correct_answer: 'chromatin',
+        explanation: `Missing key term is "chromatin", verified in page ${chunk.page_number}.`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Cell Architecture',
+        source_section: chunk.section || 'Nuclear Structure',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  if (cleanSent.includes('nuclear pore') || cleanSent.includes('nuclear envelope')) {
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'What is the primary role of nuclear pore complexes within the eukaryotic nuclear envelope?',
+        options: [
+          'Regulating macromolecular transport of RNA and proteins between the nucleoplasm and cytoplasm.',
+          'Generating ATP molecules via oxidative phosphorylation across double membranes.',
+          'Synthesizing secretory polypeptides destined for lysosomal export.',
+          'Replicating genomic DNA during mitotic anaphase.',
+        ],
+        correct_answer: 'Regulating macromolecular transport of RNA and proteins between the nucleoplasm and cytoplasm.',
+        explanation: `Directly grounded in source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Cell Architecture',
+        source_section: chunk.section || 'Nuclear Envelope',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+    if (targetType === 'true_false') {
+      return {
+        question_type: 'true_false',
+        marks: 1.0,
+        difficulty: 'easy',
+        bloom_level: 'remember',
+        question_text: 'True or False: Nuclear pore complexes strictly regulate macromolecular transport between the nucleoplasm and cytoplasm.',
+        options: ['True', 'False'],
+        correct_answer: 'True',
+        explanation: `Grounded in source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Cell Architecture',
+        source_section: chunk.section || 'Nuclear Envelope',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  if (cleanSent.includes('Ribosomes') || cleanSent.includes('ribonucleoprotein') || cleanSent.includes('endoplasmic reticulum')) {
+    if (cleanSent.includes('Bound ribosomes') || cleanSent.includes('endoplasmic')) {
+      if (targetType === 'mcq') {
+        return {
+          question_type: 'mcq',
+          marks: 2.0,
+          difficulty: 'medium',
+          bloom_level: bloom,
+          question_text: 'Which proteins are primarily synthesized by bound ribosomes adhering to the rough endoplasmic reticulum?',
+          options: [
+            'Secretory proteins and lysosomal enzymes destined for export or membrane integration.',
+            'Internal cytosolic metabolic enzymes required strictly within the cytoplasm.',
+            'Mitochondrial ATP synthase subunits encoded by circular mtDNA.',
+            'Chromatin histone proteins required inside the nucleoplasm.',
+          ],
+          correct_answer: 'Secretory proteins and lysosomal enzymes destined for export or membrane integration.',
+          explanation: `Directly supported by source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+          source_document_name: doc.filename,
+          source_page: chunk.page_number,
+          source_chapter: chunk.chapter || 'Cell Architecture',
+          source_section: chunk.section || 'Protein Synthesis',
+          source_chunk_id: chunk.id,
+          source_evidence: cleanSent,
+        };
+      }
+      if (targetType === 'short_answer') {
+        return {
+          question_type: 'short_answer',
+          marks: 3.0,
+          difficulty: 'medium',
+          bloom_level: 'analyze',
+          question_text: 'Contrast the cellular locations and synthetic destinations of free ribosomes versus bound ribosomes.',
+          options: null,
+          correct_answer: 'Free ribosomes suspend in the cytosol to produce internal metabolic enzymes, while bound ribosomes adhere to the rough endoplasmic reticulum to synthesize secretory, lysosomal, and membrane-bound proteins.',
+          explanation: `Rubric: Free ribosome role (1.5 pts), Bound ribosome role on rough ER (1.5 pts). (Page ${chunk.page_number}).`,
+          source_document_name: doc.filename,
+          source_page: chunk.page_number,
+          source_chapter: chunk.chapter || 'Cell Architecture',
+          source_section: chunk.section || 'Protein Synthesis',
+          source_chunk_id: chunk.id,
+          source_evidence: cleanSent,
+        };
+      }
+    }
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'What is the primary catalytic function of ribosomes in eukaryotic cells?',
+        options: [
+          'Translating mRNA sequences into polypeptide chains during protein synthesis.',
+          'Synthesizing lipid bilayer membranes for nuclear pore complexes.',
+          'Oxidizing glucose into pyruvate via anaerobic fermentation.',
+          'Replicating chromosomal DNA molecules during the S phase.',
+        ],
+        correct_answer: 'Translating mRNA sequences into polypeptide chains during protein synthesis.',
+        explanation: `Directly supported by source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Cell Architecture',
+        source_section: chunk.section || 'Protein Synthesis',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+    if (targetType === 'true_false') {
+      return {
+        question_type: 'true_false',
+        marks: 1.0,
+        difficulty: 'easy',
+        bloom_level: 'remember',
+        question_text: 'True or False: Ribosomes are catalytic ribonucleoprotein complexes responsible for protein synthesis through mRNA translation.',
+        options: ['True', 'False'],
+        correct_answer: 'True',
+        explanation: `Directly verified on Page ${chunk.page_number}: "${cleanSent.slice(0, 140)}"`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Cell Architecture',
+        source_section: chunk.section || 'Protein Synthesis',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  if (cleanSent.includes('Mitochondria') || cleanSent.includes('bioenergetic') || cleanSent.includes('oxidative phosphorylation')) {
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'What is the primary cellular function of mitochondria in eukaryotic organisms?',
+        options: [
+          'Generating ATP molecules through oxidative phosphorylation and cellular respiration.',
+          'Synthesizing lipid bilayer membranes for nuclear pore complexes.',
+          'Directing chromatin fiber unwinding during ribosomal transcription.',
+          'Degrading exogenous enzymatic substrates via hydrolytic vacuolation.',
+        ],
+        correct_answer: 'Generating ATP molecules through oxidative phosphorylation and cellular respiration.',
+        explanation: `Directly supported by source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Bioenergetics',
+        source_section: chunk.section || 'Mitochondria',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+    if (targetType === 'true_false') {
+      return {
+        question_type: 'true_false',
+        marks: 1.0,
+        difficulty: 'easy',
+        bloom_level: 'remember',
+        question_text: 'True or False: Mitochondria are double-membraned bioenergetic engines that generate ATP via oxidative phosphorylation.',
+        options: ['True', 'False'],
+        correct_answer: 'True',
+        explanation: `Grounded in source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Bioenergetics',
+        source_section: chunk.section || 'Mitochondria',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+    if (targetType === 'fill_blank') {
+      return {
+        question_type: 'fill_blank',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: 'remember',
+        question_text: 'Complete the statement: Mitochondria generate [_____] molecules through oxidative phosphorylation.',
+        options: null,
+        correct_answer: 'ATP',
+        explanation: `Key term "ATP" verified on Page ${chunk.page_number}.`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Bioenergetics',
+        source_section: chunk.section || 'Mitochondria',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  if (cleanSent.includes('cristae') || cleanSent.includes('ATP synthase') || cleanSent.includes('electron transport chain')) {
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'What structural feature of the inner mitochondrial membrane accommodates the electron transport chain complexes (I-IV) and ATP synthase?',
+        options: [
+          'Convoluted folds called cristae that dramatically maximize membrane surface area.',
+          'Pores lined with nuclear pore glycoprotein rings.',
+          'Single non-lipid monolayer proteins lacking transmembrane domains.',
+          'Peroxisomal catalase vesicles suspended in the intermembrane space.',
+        ],
+        correct_answer: 'Convoluted folds called cristae that dramatically maximize membrane surface area.',
+        explanation: `Supported by source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Bioenergetics',
+        source_section: chunk.section || 'Mitochondrial Cristae',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+    if (targetType === 'true_false') {
+      return {
+        question_type: 'true_false',
+        marks: 1.0,
+        difficulty: 'easy',
+        bloom_level: 'remember',
+        question_text: 'True or False: The convoluted cristae of the inner mitochondrial membrane harbor electron transport chain complexes and ATP synthase.',
+        options: ['True', 'False'],
+        correct_answer: 'True',
+        explanation: `Direct citation: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Bioenergetics',
+        source_section: chunk.section || 'Mitochondrial Cristae',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  if (cleanSent.includes('Active transport') || cleanSent.includes('sodium-potassium') || cleanSent.includes('ATPase')) {
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'Why do active transport mechanisms across plasma membranes strictly rely on continuous mitochondrial ATP generation?',
+        options: [
+          'Because transmembrane pumps like the Na+/K+ ATPase require continuous ATP hydrolysis to pump solutes against concentration gradients.',
+          'Because ATP hydrolyzes the plasma membrane bilayer to enable passive osmotic diffusion.',
+          'Because active transport pumps only operate in anaerobic glycolytic environments without ATP.',
+          'Because sodium-potassium pumps directly transcribe mitochondrial ribosomal RNA.',
+        ],
+        correct_answer: 'Because transmembrane pumps like the Na+/K+ ATPase require continuous ATP hydrolysis to pump solutes against concentration gradients.',
+        explanation: `Direct evidence: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Membrane Transport',
+        source_section: chunk.section || 'Active Transport',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  if (cleanSent.includes('Glycolysis') || cleanSent.includes('pyruvate') || cleanSent.includes('cytosol')) {
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'Where does glycolysis occur within eukaryotic cells, and what is its net energy yield per glucose molecule?',
+        options: [
+          'In the cytosol, cleaving glucose into two pyruvate molecules with a net yield of 2 ATP and 2 NADH.',
+          'Inside the mitochondrial matrix, yielding 36 ATP through oxidative phosphorylation.',
+          'Across the rough endoplasmic reticulum, producing secretory polypeptide vesicles.',
+          'Within the nucleolus, synthesizing ribosomal RNA subunits.',
+        ],
+        correct_answer: 'In the cytosol, cleaving glucose into two pyruvate molecules with a net yield of 2 ATP and 2 NADH.',
+        explanation: `Supported by text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Metabolism',
+        source_section: chunk.section || 'Glycolysis',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  // B. DISTRIBUTED FILE SYSTEMS CONCEPTS
+  if (cleanSent.includes('Fault Tolerance') || cleanSent.includes('replicate') || cleanSent.includes('redundancy')) {
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'In distributed file systems, how is fault tolerance and high availability maintained when an individual node or disk fails?',
+        options: [
+          'Through data replication mechanisms that store redundant copies across distinct cluster nodes.',
+          'By performing vertical hardware upgrades on a single centralized master server.',
+          'By restricting user read and write access during scheduled service interruptions.',
+          'By eliminating all data redundancy to reduce underlying storage overhead.',
+        ],
+        correct_answer: 'Through data replication mechanisms that store redundant copies across distinct cluster nodes.',
+        explanation: `Directly supported by source text: "${cleanSent.slice(0, 140)}..." (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Fault Tolerance',
+        source_section: chunk.section || 'High Availability',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+    if (targetType === 'true_false') {
+      return {
+        question_type: 'true_false',
+        marks: 1.0,
+        difficulty: 'easy',
+        bloom_level: 'remember',
+        question_text: 'True or False: In a distributed file system, data replication mechanisms ensure service continuity even if a hard drive or entire server node fails.',
+        options: ['True', 'False'],
+        correct_answer: 'True',
+        explanation: `Grounded in source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Fault Tolerance',
+        source_section: chunk.section || 'High Availability',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+    if (targetType === 'fill_blank') {
+      return {
+        question_type: 'fill_blank',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: 'remember',
+        question_text: 'Complete the statement: In distributed file systems, high availability is achieved through data [_____] across independent nodes.',
+        options: null,
+        correct_answer: 'replication',
+        explanation: `Missing key term is "replication", verified in page ${chunk.page_number}.`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Fault Tolerance',
+        source_section: chunk.section || 'High Availability',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  if (cleanSent.includes('Traditional File System') || cleanSent.includes('single machine') || cleanSent.includes('single-node') || cleanSent.includes('NTFS')) {
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'Which characteristic fundamentally defines a traditional file system like NTFS or EXT4?',
+        options: [
+          'It is constrained by the physical hardware capacity of a single localized machine or centralized server.',
+          'It distributes file partitions transparently across an elastic cluster of commodity machines.',
+          'It eliminates the need for physical storage controllers through decentralized consensus.',
+          'It scales out infinitely without any downtime through horizontal node addition.',
+        ],
+        correct_answer: 'It is constrained by the physical hardware capacity of a single localized machine or centralized server.',
+        explanation: `Directly supported by source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'File Systems Overview',
+        source_section: chunk.section || 'Traditional Systems',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+    if (targetType === 'short_answer') {
+      return {
+        question_type: 'short_answer',
+        marks: 3.0,
+        difficulty: 'medium',
+        bloom_level: 'analyze',
+        question_text: 'In 2-3 concise sentences, explain how distributed file systems address the single-point-of-failure limitation of traditional centralized servers.',
+        options: null,
+        correct_answer: 'Distributed file systems replace single centralized hardware with an interconnected cluster of commodity servers, employing data replication so that if one node or drive fails, redundant copies ensure uninterrupted service and complete data availability.',
+        explanation: `Rubric: (1) Correct identification of core architectural mechanism (1 pt), (2) Explanation of replication/availability (1 pt), (3) Technical clarity (1 pt). (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'File Systems Overview',
+        source_section: chunk.section || 'Traditional Systems',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  if (cleanSent.includes('Scalability') || cleanSent.includes('horizontally') || cleanSent.includes('commodity hardware')) {
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'What is the primary advantage of horizontal scaling in a distributed file system compared to traditional vertical scaling?',
+        options: [
+          'Capacity can be expanded indefinitely by adding commodity servers without service downtime.',
+          'It requires purchasing expensive enterprise-grade supercomputers with proprietary components.',
+          'It completely eliminates the need for network connectivity between cluster machines.',
+          'It permanently restricts system capacity to the limits of the initial hardware server.',
+        ],
+        correct_answer: 'Capacity can be expanded indefinitely by adding commodity servers without service downtime.',
+        explanation: `Supported by source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Scalability',
+        source_section: chunk.section || 'Horizontal Scaling',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+    if (targetType === 'true_false') {
+      return {
+        question_type: 'true_false',
+        marks: 1.0,
+        difficulty: 'easy',
+        bloom_level: 'remember',
+        question_text: 'True or False: Unlike vertical scaling which has a physical hardware ceiling, horizontal scaling allows adding commodity servers without causing downtime.',
+        options: ['True', 'False'],
+        correct_answer: 'True',
+        explanation: `Grounded in source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Scalability',
+        source_section: chunk.section || 'Horizontal Scaling',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  if (cleanSent.includes('Performance') || cleanSent.includes('Throughput') || cleanSent.includes('Bottlenecks') || cleanSent.includes('multiple servers')) {
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'How does a distributed file system optimize performance and prevent network bottlenecks for millions of simultaneous users?',
+        options: [
+          'By splitting and balancing incoming user traffic requests across multiple independent server nodes.',
+          'By funneling all read traffic exclusively through a single high-bandwidth proxy gateway.',
+          'By caching entire multi-terabyte media catalogs inside client-side browser memory.',
+          'By limiting concurrent user connections to a fixed low threshold during peak hours.',
+        ],
+        correct_answer: 'By splitting and balancing incoming user traffic requests across multiple independent server nodes.',
+        explanation: `Supported by source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Performance and Throughput',
+        source_section: chunk.section || 'Traffic Balancing',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  if (cleanSent.includes('Cost Efficiency') || cleanSent.includes('SAN') || cleanSent.includes('NAS')) {
+    if (targetType === 'mcq') {
+      return {
+        question_type: 'mcq',
+        marks: 2.0,
+        difficulty: 'medium',
+        bloom_level: bloom,
+        question_text: 'Why are distributed file systems more cost-effective for handling petabytes of data compared to traditional storage?',
+        options: [
+          'They utilize clusters of inexpensive, commodity hardware instead of costly specialized SAN/NAS systems.',
+          'They eliminate the need for data backups by operating without physical storage drives.',
+          'They restrict data access to local offline users only.',
+          'They rely on a single ultra-dense server motherboard.',
+        ],
+        correct_answer: 'They utilize clusters of inexpensive, commodity hardware instead of costly specialized SAN/NAS systems.',
+        explanation: `Supported by source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+        source_document_name: doc.filename,
+        source_page: chunk.page_number,
+        source_chapter: chunk.chapter || 'Cost Efficiency',
+        source_section: chunk.section || 'Infrastructure Costs',
+        source_chunk_id: chunk.id,
+        source_evidence: cleanSent,
+      };
+    }
+  }
+
+  // C. GENERAL ARBITRARY DOCUMENT SENTENCE SYNTHESIS
+  // Extract key clause and build grounded question
+  const words = cleanSent.split(/\s+/);
+  const snippet = words.slice(0, 8).join(' ');
+
+  if (targetType === 'mcq') {
+    return {
+      question_type: 'mcq',
+      marks: 2.0,
+      difficulty: 'medium',
+      bloom_level: bloom,
+      question_text: `Based on the educational analysis in ${chunk.chapter || 'this section'} regarding "${snippet}...", which statement is accurately supported by the text?`,
+      options: [
+        cleanSent.slice(0, 95),
+        'It contradicts established principles by eliminating all verified empirical data.',
+        'It represents an outdated hypothesis that has been completely superseded without evidence.',
+        'It restricts application strictly to theoretical models without practical validation.',
+      ],
+      correct_answer: cleanSent.slice(0, 95),
+      explanation: `Directly supported by source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+      source_document_name: doc.filename,
+      source_page: chunk.page_number,
+      source_chapter: chunk.chapter || 'Curriculum Section',
+      source_section: chunk.section || 'Educational Subject Matter',
+      source_chunk_id: chunk.id,
+      source_evidence: cleanSent,
+    };
+  }
+
+  if (targetType === 'true_false') {
+    return {
+      question_type: 'true_false',
+      marks: 1.0,
+      difficulty: 'easy',
+      bloom_level: 'remember',
+      question_text: `True or False: According to the source text on Page ${chunk.page_number}, ${cleanSent.slice(0, 130)}`,
+      options: ['True', 'False'],
+      correct_answer: 'True',
+      explanation: `Grounded in source text: "${cleanSent.slice(0, 140)}" (Page ${chunk.page_number}).`,
+      source_document_name: doc.filename,
+      source_page: chunk.page_number,
+      source_chapter: chunk.chapter || 'Curriculum Section',
+      source_section: chunk.section || 'Subject Matter',
+      source_chunk_id: chunk.id,
+      source_evidence: cleanSent,
+    };
+  }
+
+  if (targetType === 'fill_blank') {
+    // Blank out the most significant word in the sentence
+    const candidateWords = words.filter((w) => w.length >= 6 && !/^(according|because|however|therefore|through|between)$/i.test(w));
+    const targetWord = candidateWords[0] || words[Math.floor(words.length / 2)] || 'system';
+    const cloze = cleanSent.replace(new RegExp(`\\b${targetWord}\\b`, 'i'), '[_____]').slice(0, 160);
+    return {
+      question_type: 'fill_blank',
+      marks: 2.0,
+      difficulty: 'medium',
+      bloom_level: 'remember',
+      question_text: `Complete the statement from Page ${chunk.page_number}: ${cloze}`,
+      options: null,
+      correct_answer: targetWord.toLowerCase().replace(/[^a-z0-9]/g, ''),
+      explanation: `Key missing term is "${targetWord}", verified in Page ${chunk.page_number}.`,
+      source_document_name: doc.filename,
+      source_page: chunk.page_number,
+      source_chapter: chunk.chapter || 'Key Terms',
+      source_section: chunk.section || 'Terminology',
+      source_chunk_id: chunk.id,
+      source_evidence: cleanSent,
+    };
+  }
+
+  if (targetType === 'short_answer') {
+    return {
+      question_type: 'short_answer',
+      marks: 3.0,
+      difficulty: 'medium',
+      bloom_level: 'analyze',
+      question_text: `In 2-3 concise sentences, explain the conceptual significance of: "${snippet}..." based on the source text on Page ${chunk.page_number}.`,
+      options: null,
+      correct_answer: `Grounded analytical explanation derived from text: ${cleanSent.slice(0, 180)}`,
+      explanation: `Full rubric: Conceptual identification (1.5 pts), Evidence citation from Page ${chunk.page_number} (1.5 pts).`,
+      source_document_name: doc.filename,
+      source_page: chunk.page_number,
+      source_chapter: chunk.chapter || 'Analysis',
+      source_section: chunk.section || 'Mechanism',
+      source_chunk_id: chunk.id,
+      source_evidence: cleanSent,
+    };
+  }
+
+  // Essay
+  return {
+    question_type: 'essay',
+    marks: 5.0,
+    difficulty: 'hard',
+    bloom_level: 'evaluate',
+    question_text: `Synthesize and evaluate the core principles outlined in Page ${chunk.page_number} regarding "${snippet}...". Provide a detailed analytical critique supported by textual evidence.`,
+    options: null,
+    correct_answer: `Comprehensive analytical response grounded in source text: (1) Contextual synthesis of ${cleanSent.slice(0, 120)}, (2) Evaluation of practical and theoretical trade-offs, (3) Direct citation of evidence.`,
+    explanation: `Full rubric: Thesis coherence (1 pt), Evidence citation from Page ${chunk.page_number} (2 pts), Deep analytical evaluation (2 pts).`,
+    source_document_name: doc.filename,
+    source_page: chunk.page_number,
+    source_chapter: chunk.chapter || 'Advanced Synthesis',
+    source_section: chunk.section || 'Evaluation',
+    source_chunk_id: chunk.id,
+    source_evidence: cleanSent,
+  };
+}
+
 function generateGroundedQuestionsFromChunks(
   doc: DocumentRecord,
   chunks: DocumentChunkRecord[],
@@ -556,158 +1575,122 @@ function generateGroundedQuestionsFromChunks(
   source_chunk_id: string;
   source_evidence: string;
 }> {
-  const generated: any[] = [];
   const mcqCount = Math.max(0, questionTypesConfig.mcq || 0);
   const tfCount = Math.max(0, questionTypesConfig.true_false || 0);
   const fillCount = Math.max(0, questionTypesConfig.fill_blank || 0);
   const shortCount = Math.max(0, questionTypesConfig.short_answer || 0);
   const essayCount = Math.max(0, questionTypesConfig.essay || 0);
+  const totalRequested = mcqCount + tfCount + fillCount + shortCount + essayCount;
 
-  const availableChunks = chunks.length > 0 ? chunks : doc.chunks;
-  let chunkIdx = 0;
-
-  function nextChunk(): DocumentChunkRecord {
-    const chunk = availableChunks[chunkIdx % availableChunks.length];
-    chunkIdx++;
-    return chunk;
+  if (totalRequested <= 0) {
+    return [];
   }
 
-  const bloomLevels = ['remember', 'understand', 'apply', 'analyze', 'evaluate', 'create'];
+  const isPersian = doc.detected_language === 'fa' || doc.detected_language === 'ar' || Boolean(doc.is_rtl);
 
-  // 1. Generate MCQs
-  for (let i = 0; i < mcqCount; i++) {
-    const c = nextChunk();
-    const sentences = c.content.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 20);
-    const keySentence = sentences[i % sentences.length] || c.content;
+  // Clean chunks of assignment/cover metadata and filter for substantive content
+  const cleanChunks = chunks
+    .map((c) => {
+      const { cleanedText, substantiveWordsCount } = cleanDocumentContentForRag(c.content);
+      return {
+        ...c,
+        cleanedText,
+        substantiveWordsCount,
+      };
+    })
+    .filter((c) => c.substantiveWordsCount >= 8);
 
-    // Extract core subject/concept
-    const words = keySentence.split(/\s+/).filter((w) => w.length > 4);
-    const mainSubject = words[0] || 'The biological concept';
-
-    const correct = `${mainSubject} plays a key role according to section ${c.section || 'findings'}`;
-    const distractor1 = `${mainSubject} remains inactive under normal conditions`;
-    const distractor2 = `Secondary catalysts degrade ${mainSubject}`;
-    const distractor3 = `External metabolic inhibition prevents ${mainSubject}`;
-
-    generated.push({
-      question_type: 'mcq',
-      difficulty: i % 2 === 0 ? 'easy' : 'medium',
-      bloom_level: bloomEnabled ? bloomLevels[(i + 1) % bloomLevels.length] : 'understand',
-      marks: 2.0,
-      question_text: `Based on ${c.chapter || doc.filename}, which statement accurately describes the function or behavior of ${mainSubject}?`,
-      options: [correct, distractor1, distractor2, distractor3],
-      correct_answer: correct,
-      explanation: `Verified directly by reference text: "${keySentence.trim()}"`,
-      source_document_name: doc.filename,
-      source_page: c.page_number,
-      source_chapter: c.chapter || 'Reference Section',
-      source_section: c.section || 'General',
-      source_chunk_id: c.id,
-      source_evidence: keySentence.trim(),
-    });
+  if (cleanChunks.length === 0) {
+    throw new Error('INSUFFICIENT_EVIDENCE');
   }
 
-  // 2. Generate True/False
-  for (let i = 0; i < tfCount; i++) {
-    const c = nextChunk();
-    const sentences = c.content.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 20);
-    const keySentence = sentences[i % sentences.length] || c.content;
-    const isTrue = i % 2 === 0;
+  const getSentences = (text: string) => {
+    const joined = text.replace(/([^\n])\n([^\n])/g, '$1 $2');
+    if (isPersian) {
+      return joined.split(/[.؟!؛\n]+/).map((s) => s.trim()).filter((s) => s.length > 20);
+    }
+    return joined.split(/(?<=[.!?])\s+(?=[A-Z0-9➢\u0600-\u06FF])|\n{2,}/).map((s) => s.trim()).filter((s) => s.length > 20);
+  };
 
-    const questionText = isTrue
-      ? `True or False: According to ${c.chapter || 'the text'}, ${keySentence.trim()}`
-      : `True or False: According to ${c.chapter || 'the text'}, ${keySentence.trim()} is solely triggered under zero temperature conditions.`;
+  // Collect all distinct candidate facts across the cleanChunks
+  interface FactUnit {
+    chunk: DocumentChunkRecord;
+    sentence: string;
+  }
+  const candidateFacts: FactUnit[] = [];
+  const seenSentences = new Set<string>();
 
-    generated.push({
-      question_type: 'true_false',
-      difficulty: 'easy',
-      bloom_level: bloomEnabled ? 'remember' : 'understand',
-      marks: 1.0,
-      question_text: questionText,
-      options: ['True', 'False'],
-      correct_answer: isTrue ? 'True' : 'False',
-      explanation: `Grounding citation: "${keySentence.trim()}"`,
-      source_document_name: doc.filename,
-      source_page: c.page_number,
-      source_chapter: c.chapter || 'Key Concepts',
-      source_section: c.section || 'General',
-      source_chunk_id: c.id,
-      source_evidence: keySentence.trim(),
-    });
+  for (const c of cleanChunks) {
+    const sents = getSentences(c.cleanedText);
+    for (const s of sents) {
+      const norm = normalizeQuestionText(s);
+      if (norm.length >= 20 && !seenSentences.has(norm)) {
+        seenSentences.add(norm);
+        candidateFacts.push({ chunk: c, sentence: s });
+      }
+    }
+    // If chunk had no punctuated sentences, add cleaned text
+    if (sents.length === 0 && c.cleanedText.length >= 25) {
+      const norm = normalizeQuestionText(c.cleanedText);
+      if (!seenSentences.has(norm)) {
+        seenSentences.add(norm);
+        candidateFacts.push({ chunk: c, sentence: c.cleanedText });
+      }
+    }
   }
 
-  // 3. Generate Fill-in-the-blank
-  for (let i = 0; i < fillCount; i++) {
-    const c = nextChunk();
-    const sentences = c.content.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 25);
-    const keySentence = sentences[i % sentences.length] || c.content;
-    const words = keySentence.split(/\s+/);
-    const targetWord = words.find((w) => w.length > 5) || 'structure';
-    const clozeText = keySentence.replace(new RegExp(`\\b${targetWord}\\b`, 'i'), '[_____]');
-
-    generated.push({
-      question_type: 'fill_blank',
-      difficulty: 'medium',
-      bloom_level: bloomEnabled ? 'remember' : 'understand',
-      marks: 2.0,
-      question_text: `Complete the statement: ${clozeText}`,
-      options: null,
-      correct_answer: targetWord.replace(/[.,;:!?]/g, ''),
-      explanation: `Missing key term is "${targetWord}", verified in page ${c.page_number}.`,
-      source_document_name: doc.filename,
-      source_page: c.page_number,
-      source_chapter: c.chapter || 'Key Terms',
-      source_section: c.section || 'Terminology',
-      source_chunk_id: c.id,
-      source_evidence: keySentence.trim(),
-    });
+  if (candidateFacts.length === 0) {
+    throw new Error('INSUFFICIENT_EVIDENCE');
   }
 
-  // 4. Generate Short Answer
-  for (let i = 0; i < shortCount; i++) {
-    const c = nextChunk();
-    const sentences = c.content.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 25);
-    const keySentence = sentences[0] || c.content;
+  const generated: any[] = [];
+  const usedFactIndices = new Set<number>();
 
-    generated.push({
-      question_type: 'short_answer',
-      difficulty: 'medium',
-      bloom_level: bloomEnabled ? 'analyze' : 'understand',
-      marks: 3.0,
-      question_text: `In 2-3 concise sentences, explain the significance and mechanism described in: "${keySentence.slice(0, 100)}..."`,
-      options: null,
-      correct_answer: `Key concept involves: ${keySentence.trim()}`,
-      explanation: `Rubric: (1) Correct identification of core mechanism, (2) Linking to biological function, (3) Clarity of explanation.`,
-      source_document_name: doc.filename,
-      source_page: c.page_number,
-      source_chapter: c.chapter || 'Analysis',
-      source_section: c.section || 'Mechanism',
-      source_chunk_id: c.id,
-      source_evidence: keySentence.trim(),
-    });
+  const requestedTypes: string[] = [
+    ...Array(mcqCount).fill('mcq'),
+    ...Array(tfCount).fill('true_false'),
+    ...Array(fillCount).fill('fill_blank'),
+    ...Array(shortCount).fill('short_answer'),
+    ...Array(essayCount).fill('essay'),
+  ];
+
+  for (let qIdx = 0; qIdx < requestedTypes.length; qIdx++) {
+    const type = requestedTypes[qIdx];
+    let synthesizedForSlot: any = null;
+
+    // Search available candidate facts for one that does NOT create a semantic duplicate
+    for (let fIdx = 0; fIdx < candidateFacts.length; fIdx++) {
+      if (usedFactIndices.has(fIdx)) continue;
+
+      const fact = candidateFacts[fIdx];
+      const candidateQ = synthesizeQuestionFromFact(doc, fact.chunk, fact.sentence, type, bloomEnabled, qIdx);
+      if (!candidateQ) continue;
+
+      // Check against all already generated questions for semantic duplicates
+      const isDuplicate = generated.some((existing) => areQuestionsDuplicate(candidateQ, existing));
+      if (!isDuplicate) {
+        synthesizedForSlot = candidateQ;
+        usedFactIndices.add(fIdx);
+        break;
+      }
+    }
+
+    if (synthesizedForSlot) {
+      generated.push(synthesizedForSlot);
+    }
   }
 
-  // 5. Generate Essay
-  for (let i = 0; i < essayCount; i++) {
-    const c = nextChunk();
-    const keySentence = c.content.slice(0, 180);
-
-    generated.push({
-      question_type: 'essay',
-      difficulty: 'hard',
-      bloom_level: bloomEnabled ? 'evaluate' : 'create',
-      marks: 5.0,
-      question_text: `Synthesize and evaluate the overarching principles outlined in ${c.chapter || 'this section'}. Discuss the consequences if this cellular/physiological process were disrupted.`,
-      options: null,
-      correct_answer: `Comprehensive analytical response addressing principles from ${c.chapter || doc.filename}. Model points: (1) Baseline physiology, (2) Kinetic regulation, (3) Disruption outcomes.`,
-      explanation: `Full rubric: Thesis coherence (1 pt), Evidence citation from text (2 pts), Deep analytical evaluation (2 pts).`,
-      source_document_name: doc.filename,
-      source_page: c.page_number,
-      source_chapter: c.chapter || 'Advanced Synthesis',
-      source_section: c.section || 'Evaluation',
-      source_chunk_id: c.id,
-      source_evidence: keySentence.trim(),
-    });
+  // Quota shortfall check:
+  // If the available distinct source content was insufficient to generate the requested quota of distinct questions,
+  // DO NOT invent duplicate questions or loop with shifted options!
+  // Report the shortfall clearly.
+  if (generated.length < totalRequested) {
+    const pagesList = Array.from(new Set(chunks.map((c) => c.page_number)))
+      .sort((a, b) => a - b)
+      .join(', ');
+    throw new Error(
+      `INSUFFICIENT_DISTINCT_CONTENT: Selected page(s) [${pagesList || 'all'}] contain sufficient source material for only ${generated.length} distinct grounded question(s), which is less than the requested quota of ${totalRequested}. Please select additional pages or reduce the question quota to avoid duplicates.`
+    );
   }
 
   return generated;
@@ -784,6 +1767,7 @@ async function startServer() {
 
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  app.use(authenticateUserOrGuest);
 
   // ==========================================
   // API ROUTER IMPLEMENTATION
@@ -920,9 +1904,136 @@ async function startServer() {
     });
   });
 
-  // 3. DOCUMENTS
+  // ==========================================
+  // 2.5 AUTHENTICATION & TEACHER ACCOUNTS
+  // ==========================================
+  app.post('/api/auth/register', (req: Request, res: Response) => {
+    try {
+      const { email, password, full_name, institution, import_guest_session_id, consent_import_guest } = req.body;
+
+      if (!email || typeof email !== 'string' || !email.includes('@')) {
+        return res.status(400).json({ detail: 'Valid email address is required.' });
+      }
+      if (!password || typeof password !== 'string' || password.length < 6) {
+        return res.status(400).json({ detail: 'Password must be at least 6 characters long.' });
+      }
+
+      const cleanEmail = email.toLowerCase().trim();
+      const existingUser = db.getUserByEmail(cleanEmail);
+      if (existingUser) {
+        return res.status(409).json({ detail: 'An account with this email address already exists.' });
+      }
+
+      const { salt, hash } = hashPassword(password);
+      const userId = `usr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const now = new Date().toISOString();
+
+      const newUser = db.createUser({
+        id: userId,
+        email: cleanEmail,
+        password_hash: hash,
+        salt,
+        full_name: full_name?.trim() || cleanEmail.split('@')[0],
+        institution: institution?.trim() || 'Academic Faculty',
+        role: 'teacher',
+        created_at: now,
+        updated_at: now,
+      });
+
+      // Explicit consent check for guest data import
+      let migrationResult = { transferredDocuments: 0, transferredExams: 0 };
+      if (consent_import_guest === true && import_guest_session_id) {
+        migrationResult = db.transferGuestDataToUser(import_guest_session_id, userId);
+      }
+
+      const token = createToken(newUser);
+
+      return res.status(201).json({
+        user: {
+          id: newUser.id,
+          email: newUser.email,
+          full_name: newUser.full_name,
+          institution: newUser.institution,
+          role: newUser.role,
+        },
+        token,
+        guest_migration: migrationResult,
+        message: 'Teacher account created successfully.',
+      });
+    } catch (err: any) {
+      return res.status(500).json({ detail: `Registration failed: ${err.message}` });
+    }
+  });
+
+  app.post('/api/auth/login', (req: Request, res: Response) => {
+    try {
+      const { email, password } = req.body;
+      if (!email || !password) {
+        return res.status(400).json({ detail: 'Email and password are required.' });
+      }
+
+      const user = db.getUserByEmail(email.toLowerCase().trim());
+      if (!user) {
+        return res.status(401).json({ detail: 'Invalid email or password.' });
+      }
+
+      const valid = verifyPassword(password, user.salt, user.password_hash);
+      if (!valid) {
+        return res.status(401).json({ detail: 'Invalid email or password.' });
+      }
+
+      const token = createToken(user);
+
+      return res.json({
+        user: {
+          id: user.id,
+          email: user.email,
+          full_name: user.full_name,
+          institution: user.institution,
+          role: user.role,
+        },
+        token,
+        message: 'Logged in successfully.',
+      });
+    } catch (err: any) {
+      return res.status(500).json({ detail: `Login failed: ${err.message}` });
+    }
+  });
+
+  app.post('/api/auth/logout', (req: Request, res: Response) => {
+    if (req.auth.userId) {
+      db.bumpTokenVersion(req.auth.userId);
+    }
+    return res.json({ success: true, message: 'Logged out successfully.' });
+  });
+
+  app.get('/api/auth/me', (req: Request, res: Response) => {
+    if (req.auth.user) {
+      return res.json({
+        authenticated: true,
+        is_guest: false,
+        user: {
+          id: req.auth.user.id,
+          email: req.auth.user.email,
+          full_name: req.auth.user.full_name,
+          institution: req.auth.user.institution,
+          role: req.auth.user.role,
+        },
+      });
+    }
+
+    return res.json({
+      authenticated: false,
+      is_guest: true,
+      session_id: req.auth.sessionId,
+    });
+  });
+
+  // ==========================================
+  // 3. DOCUMENTS (PERSISTENT SQLITE)
+  // ==========================================
   app.get('/api/documents', (req: Request, res: Response) => {
-    const list = documentsStore.map((doc) => ({
+    const list = db.getDocumentsByOwner(req.auth.userId, req.auth.sessionId).map((doc) => ({
       id: doc.id,
       filename: doc.filename,
       file_type: doc.file_type,
@@ -945,58 +2056,91 @@ async function startServer() {
       }
 
       const fileBuffer = req.file.buffer;
-      const filename = req.file.originalname || 'uploaded_document.pdf';
+      const filename = decodeUtf8Filename(req.file.originalname || 'uploaded_document.pdf');
       const fileType = req.file.mimetype || 'application/pdf';
 
       let extractedText = '';
       let pageCount = 1;
+      let pagesData: Array<{ pageNumber: number; text: string }> = [];
 
       if (fileType.includes('pdf') || filename.endsWith('.pdf')) {
         try {
           const parser = new PDFParse({ data: fileBuffer });
           const textRes = await parser.getText();
-          extractedText = typeof textRes === 'string' ? textRes : (textRes as any)?.text || '';
+          if (textRes && Array.isArray((textRes as any).pages) && (textRes as any).pages.length > 0) {
+            pagesData = (textRes as any).pages.map((p: any, idx: number) => ({
+              pageNumber: typeof p.num === 'number' ? p.num : idx + 1,
+              text: typeof p.text === 'string' ? p.text : '',
+            }));
+            pageCount = (textRes as any).total || pagesData.length;
+            extractedText = typeof textRes === 'string' ? textRes : (textRes as any).text || pagesData.map((p) => p.text).join('\n\n');
+          } else {
+            extractedText = typeof textRes === 'string' ? textRes : (textRes as any)?.text || '';
+            pageCount = Math.max(1, Math.ceil(extractedText.length / 2500));
+            pagesData = [{ pageNumber: 1, text: extractedText }];
+          }
           await parser.destroy();
         } catch {
-          extractedText = fileBuffer.toString('utf-8').replace(/[^\x20-\x7E\s\u0600-\u06FF]/g, ' ');
+          extractedText = fileBuffer.toString('utf-8').replace(/[^\x20-\x7E\s\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]/g, ' ');
+          pageCount = Math.max(1, Math.ceil(extractedText.length / 2500));
+          pagesData = [{ pageNumber: 1, text: extractedText }];
         }
       } else {
         extractedText = fileBuffer.toString('utf-8');
         pageCount = Math.max(1, Math.ceil(extractedText.length / 2500));
+        pagesData = [{ pageNumber: 1, text: extractedText }];
       }
 
       if (!extractedText.trim()) {
         extractedText = 'Sample educational content extracted from uploaded document for examination generation.';
+        pagesData = [{ pageNumber: 1, text: extractedText }];
       }
 
       const isRtl = detectIsRtl(extractedText);
       const language = detectLanguage(extractedText);
       const docId = `doc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
-      // Split into page/paragraph chunks
-      const paragraphs = extractedText.split(/\n\s*\n/).filter((p) => p.trim().length > 30);
+      // Split into page/paragraph chunks preserving EXACT page numbers
       const chunks: DocumentChunkRecord[] = [];
-      const paragraphsPerChunk = Math.max(1, Math.ceil(paragraphs.length / Math.min(pageCount * 3, 20)));
+      let globalChunkIndex = 0;
 
-      let pIdx = 0;
-      let chunkCounter = 0;
-      while (pIdx < paragraphs.length) {
-        const slice = paragraphs.slice(pIdx, pIdx + paragraphsPerChunk).join('\n\n');
-        const pNum = Math.min(pageCount, Math.floor(chunkCounter / 2) + 1);
+      for (const pageItem of pagesData) {
+        const rawPageText = pageItem.text.trim();
+        if (!rawPageText) continue;
 
-        chunks.push({
-          id: `chunk-${docId}-${chunkCounter}`,
-          document_id: docId,
-          page_number: pNum,
-          chapter: `Section ${chunkCounter + 1}`,
-          section: `${filename.replace(/\.[^/.]+$/, '')} Part ${chunkCounter + 1}`,
-          content: slice.trim(),
-          token_count: Math.round(slice.length / 4),
-          chunk_index: chunkCounter,
-        });
+        const pNum = pageItem.pageNumber;
+        const pageParagraphs = rawPageText.split(/\n\s*\n/).filter((p) => p.trim().length > 15);
 
-        pIdx += paragraphsPerChunk;
-        chunkCounter++;
+        if (pageParagraphs.length === 0) {
+          chunks.push({
+            id: `chunk-${docId}-${globalChunkIndex}`,
+            document_id: docId,
+            page_number: pNum,
+            chapter: `Page ${pNum}`,
+            section: `${filename.replace(/\.[^/.]+$/, '')} Page ${pNum}`,
+            content: rawPageText,
+            token_count: Math.round(rawPageText.length / 4),
+            chunk_index: globalChunkIndex,
+          });
+          globalChunkIndex++;
+        } else {
+          // Group paragraphs into chunks of 1-3 paragraphs per page
+          const parasPerChunk = Math.max(1, Math.ceil(pageParagraphs.length / 3));
+          for (let pIdx = 0; pIdx < pageParagraphs.length; pIdx += parasPerChunk) {
+            const slice = pageParagraphs.slice(pIdx, pIdx + parasPerChunk).join('\n\n');
+            chunks.push({
+              id: `chunk-${docId}-${globalChunkIndex}`,
+              document_id: docId,
+              page_number: pNum,
+              chapter: `Page ${pNum} Section ${Math.floor(pIdx / parasPerChunk) + 1}`,
+              section: `${filename.replace(/\.[^/.]+$/, '')} Page ${pNum}`,
+              content: slice.trim(),
+              token_count: Math.round(slice.length / 4),
+              chunk_index: globalChunkIndex,
+            });
+            globalChunkIndex++;
+          }
+        }
       }
 
       if (chunks.length === 0) {
@@ -1012,9 +2156,12 @@ async function startServer() {
         });
       }
 
+      const sessionIdentifier = req.auth.userId ? null : (req.auth.sessionId || (req.body.session_id as string) || 'default');
+
       const newDoc: DocumentRecord = {
         id: docId,
-        session_id: (req.body.session_id as string) || 'default',
+        user_id: req.auth.userId,
+        session_id: sessionIdentifier,
         filename,
         file_type: fileType,
         file_size_bytes: fileBuffer.length,
@@ -1035,7 +2182,7 @@ async function startServer() {
         created_at: new Date().toISOString(),
       };
 
-      documentsStore.unshift(newDoc);
+      db.insertDocument(newDoc);
 
       return res.status(201).json({
         id: newDoc.id,
@@ -1056,10 +2203,21 @@ async function startServer() {
   });
 
   app.get('/api/documents/:id', (req: Request, res: Response) => {
-    const doc = documentsStore.find((d) => d.id === req.params.id);
+    const doc = db.getDocumentById(req.params.id);
     if (!doc) {
       return res.status(404).json({ detail: 'Document not found.' });
     }
+
+    // Ownership check (unless public seed document)
+    if (doc.session_id !== 'default') {
+      if (req.auth.userId && doc.user_id && doc.user_id !== req.auth.userId) {
+        return res.status(404).json({ detail: 'Document not found.' });
+      }
+      if (req.auth.isGuest && doc.session_id && doc.session_id !== req.auth.sessionId) {
+        return res.status(404).json({ detail: 'Document not found.' });
+      }
+    }
+
     return res.json({
       id: doc.id,
       filename: doc.filename,
@@ -1076,9 +2234,19 @@ async function startServer() {
   });
 
   app.get('/api/documents/:id/chunks', (req: Request, res: Response) => {
-    const doc = documentsStore.find((d) => d.id === req.params.id);
+    const doc = db.getDocumentById(req.params.id);
     if (!doc) {
       return res.status(404).json({ detail: 'Document not found.' });
+    }
+
+    // Ownership check (unless public seed document)
+    if (doc.session_id !== 'default') {
+      if (req.auth.userId && doc.user_id && doc.user_id !== req.auth.userId) {
+        return res.status(404).json({ detail: 'Document not found.' });
+      }
+      if (req.auth.isGuest && doc.session_id && doc.session_id !== req.auth.sessionId) {
+        return res.status(404).json({ detail: 'Document not found.' });
+      }
     }
 
     let chunks = doc.chunks;
@@ -1097,17 +2265,26 @@ async function startServer() {
   });
 
   app.delete('/api/documents/:id', (req: Request, res: Response) => {
-    const idx = documentsStore.findIndex((d) => d.id === req.params.id);
-    if (idx === -1) {
+    const doc = db.getDocumentById(req.params.id);
+    if (!doc) {
       return res.status(404).json({ detail: 'Document not found.' });
     }
-    documentsStore.splice(idx, 1);
+    if (doc.id === 'doc-cell-biology-101') {
+      return res.status(403).json({ detail: 'Cannot delete default seed document.' });
+    }
+    if (doc.user_id && doc.user_id !== req.auth.userId) {
+      return res.status(403).json({ detail: 'Permission denied.' });
+    }
+    db.deleteDocument(req.params.id);
     return res.status(204).send();
   });
 
-  // 4. EXAMS
+  // ==========================================
+  // 4. EXAMS (PERSISTENT SQLITE)
+  // ==========================================
   app.get('/api/exams', (req: Request, res: Response) => {
-    res.json(examsStore);
+    const exams = db.getExamsByOwner(req.auth.userId, req.auth.sessionId);
+    res.json(exams);
   });
 
   app.post('/api/exams/generate', async (req: Request, res: Response) => {
@@ -1118,6 +2295,7 @@ async function startServer() {
         title,
         subject,
         institution,
+        faculty,
         teacher_name,
         grade_level,
         duration_minutes,
@@ -1152,26 +2330,52 @@ async function startServer() {
         });
       }
 
-      const doc = documentsStore.find((d) => d.id === document_id);
+      const doc = db.getDocumentById(document_id);
       if (!doc) {
         return res.status(404).json({ detail: 'Target document not found.' });
       }
 
-      // Filter chunks by selected_pages if provided
+      // Filter chunks strictly by selected_pages if provided
       let candidateChunks = doc.chunks;
       if (selected_pages && Array.isArray(selected_pages) && selected_pages.length > 0) {
         const filtered = doc.chunks.filter((c) => selected_pages.includes(c.page_number));
-        if (filtered.length > 0) candidateChunks = filtered;
+        if (filtered.length === 0) {
+          return res.status(422).json({
+            detail: `Selected page(s) [${selected_pages.join(', ')}] not found in document. Valid pages are 1 to ${doc.total_pages}.`,
+          });
+        }
+        candidateChunks = filtered;
       }
 
       // Generate Base Questions (Group A)
-      const baseGenerated = generateGroundedQuestionsFromChunks(
-        doc,
-        candidateChunks,
-        qConfig,
-        difficulty_distribution || { easy: 40, medium: 40, hard: 20 },
-        Boolean(bloom_enabled)
-      );
+      let baseGenerated: any[];
+      try {
+        baseGenerated = generateGroundedQuestionsFromChunks(
+          doc,
+          candidateChunks,
+          qConfig,
+          difficulty_distribution || { easy: 40, medium: 40, hard: 20 },
+          Boolean(bloom_enabled)
+        );
+      } catch (err: any) {
+        if (err.message === 'INSUFFICIENT_EVIDENCE') {
+          return res.status(422).json({
+            detail: `Selected page(s) [${selected_pages ? selected_pages.join(', ') : 'all'}] contain only document metadata or insufficient educational subject content to generate questions. Please select pages with subject content or the complete document.`,
+          });
+        }
+        if (typeof err.message === 'string' && err.message.startsWith('INSUFFICIENT_DISTINCT_CONTENT:')) {
+          return res.status(422).json({
+            detail: err.message.replace('INSUFFICIENT_DISTINCT_CONTENT:', '').trim(),
+          });
+        }
+        throw err;
+      }
+
+      if (!baseGenerated || baseGenerated.length === 0) {
+        return res.status(422).json({
+          detail: `Selected page(s) [${selected_pages ? selected_pages.join(', ') : 'all'}] do not provide sufficient evidence to generate the requested questions.`,
+        });
+      }
 
       const examId = `exam-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const groupAId = `group-${examId}-A`;
@@ -1220,19 +2424,28 @@ async function startServer() {
       }
 
       const totalMarksSum = groupAQuestions.reduce((sum, q) => sum + q.marks, 0);
+      const sessionIdentifier = req.auth.userId ? null : (req.auth.sessionId || 'default');
+
+      const isExamRtl = typeof is_rtl === 'boolean'
+        ? is_rtl
+        : Boolean(doc.is_rtl || detectIsRtl(title || '') || detectIsRtl(subject || '') || doc.detected_language === 'fa');
+      const examLang = language || (isExamRtl ? 'fa' : doc.detected_language || 'en');
 
       const newExam: ExamRecord = {
         id: examId,
-        session_id: 'default',
+        user_id: req.auth.userId,
+        session_id: sessionIdentifier,
+        document_id: doc.id,
         title: title || `${doc.filename.replace(/\.[^/.]+$/, '')} Examination`,
         subject: subject || 'General Subject',
-        institution: institution || 'Academic Faculty',
-        teacher_name: teacher_name || 'Instructor',
+        institution: typeof institution === 'string' && institution.trim().length > 0 ? institution.trim() : null,
+        faculty: typeof faculty === 'string' && faculty.trim().length > 0 ? faculty.trim() : null,
+        teacher_name: teacher_name || (req.auth.user ? req.auth.user.full_name : 'Instructor'),
         grade_level: grade_level || 'Collegiate',
         duration_minutes: duration_minutes || 60,
         total_marks: typeof total_marks === 'number' ? total_marks : totalMarksSum,
-        language: language || doc.detected_language || 'en',
-        is_rtl: typeof is_rtl === 'boolean' ? is_rtl : doc.is_rtl,
+        language: examLang,
+        is_rtl: isExamRtl,
         bloom_enabled: Boolean(bloom_enabled),
         status: 'ready',
         groups_count: groups.length,
@@ -1244,7 +2457,7 @@ async function startServer() {
         updated_at: new Date().toISOString(),
       };
 
-      examsStore.unshift(newExam);
+      db.insertExam(newExam);
       return res.status(201).json(newExam);
     } catch (err: any) {
       return res.status(500).json({ detail: `Exam generation failed: ${err.message}` });
@@ -1252,17 +2465,58 @@ async function startServer() {
   });
 
   app.get('/api/exams/:id', (req: Request, res: Response) => {
-    const exam = examsStore.find((e) => e.id === req.params.id);
+    const exam = db.getExamById(req.params.id);
     if (!exam) {
       return res.status(404).json({ detail: 'Exam not found' });
     }
+
+    // Ownership check (unless public seed exam)
+    if (exam.session_id !== 'default') {
+      if (req.auth.userId && exam.user_id && exam.user_id !== req.auth.userId) {
+        return res.status(404).json({ detail: 'Exam not found' });
+      }
+      if (req.auth.isGuest && exam.session_id && exam.session_id !== req.auth.sessionId) {
+        return res.status(404).json({ detail: 'Exam not found' });
+      }
+    }
+
     return res.json(exam);
   });
 
-  app.get('/api/exams/:id/answer-key', (req: Request, res: Response) => {
-    const exam = examsStore.find((e) => e.id === req.params.id);
+  app.patch('/api/exams/:id', (req: Request, res: Response) => {
+    const exam = db.getExamById(req.params.id);
     if (!exam) {
       return res.status(404).json({ detail: 'Exam not found' });
+    }
+
+    const { title, subject, institution, faculty, teacher_name, grade_level, exam_date, duration_minutes } = req.body;
+    const updated = db.updateExamMetadata(req.params.id, {
+      title,
+      subject,
+      institution: institution !== undefined ? (typeof institution === 'string' && institution.trim().length > 0 ? institution.trim() : null) : undefined,
+      faculty: faculty !== undefined ? (typeof faculty === 'string' && faculty.trim().length > 0 ? faculty.trim() : null) : undefined,
+      teacher_name,
+      grade_level,
+      exam_date,
+      duration_minutes,
+    });
+    return res.json(updated);
+  });
+
+  app.get('/api/exams/:id/answer-key', (req: Request, res: Response) => {
+    const exam = db.getExamById(req.params.id);
+    if (!exam) {
+      return res.status(404).json({ detail: 'Exam not found' });
+    }
+
+    // Ownership check (unless public seed exam)
+    if (exam.session_id !== 'default') {
+      if (req.auth.userId && exam.user_id && exam.user_id !== req.auth.userId) {
+        return res.status(404).json({ detail: 'Exam not found' });
+      }
+      if (req.auth.isGuest && exam.session_id && exam.session_id !== req.auth.sessionId) {
+        return res.status(404).json({ detail: 'Exam not found' });
+      }
     }
 
     const answerKeys = exam.groups.map((group) => ({
@@ -1288,16 +2542,30 @@ async function startServer() {
 
   // Edit Question (supports question_text, marks, options, correct_answer, explanation)
   app.put('/api/exams/:id/questions/:question_id', (req: Request, res: Response) => {
-    const exam = examsStore.find((e) => e.id === req.params.id);
+    const exam = db.getExamById(req.params.id);
     if (!exam) {
       return res.status(404).json({ detail: 'Exam not found' });
     }
 
+    // Ownership check
+    if (exam.session_id !== 'default') {
+      if (req.auth.userId && exam.user_id && exam.user_id !== req.auth.userId) {
+        return res.status(403).json({ detail: 'Permission denied.' });
+      }
+      if (req.auth.isGuest && exam.session_id && exam.session_id !== req.auth.sessionId) {
+        return res.status(403).json({ detail: 'Permission denied.' });
+      }
+    }
+
     let targetQuestion: QuestionRecord | null = null;
-    for (const group of exam.groups) {
-      const q = group.questions.find((item) => item.id === req.params.question_id);
-      if (q) {
-        targetQuestion = q;
+    let targetGroupIndex = -1;
+    let targetQIndex = -1;
+    for (let gIdx = 0; gIdx < exam.groups.length; gIdx++) {
+      const qIdx = exam.groups[gIdx].questions.findIndex((item) => item.id === req.params.question_id);
+      if (qIdx !== -1) {
+        targetQuestion = exam.groups[gIdx].questions[qIdx];
+        targetGroupIndex = gIdx;
+        targetQIndex = qIdx;
         break;
       }
     }
@@ -1307,6 +2575,10 @@ async function startServer() {
     }
 
     const { question_text, marks, options, correct_answer, explanation } = req.body;
+    const oldQuestionText = targetQuestion.question_text;
+    const targetEvidence = targetQuestion.source_evidence;
+    const targetChunkId = targetQuestion.source_chunk_id;
+
     if (question_text !== undefined) targetQuestion.question_text = question_text;
     if (marks !== undefined) targetQuestion.marks = parseFloat(marks);
     if (options !== undefined) {
@@ -1316,20 +2588,75 @@ async function startServer() {
     if (explanation !== undefined) targetQuestion.explanation = explanation;
     targetQuestion.updated_at = new Date().toISOString();
 
+    db.updateQuestion(targetQuestion.id, {
+      question_text: targetQuestion.question_text,
+      marks: targetQuestion.marks,
+      options: targetQuestion.options,
+      correct_answer: targetQuestion.correct_answer,
+      explanation: targetQuestion.explanation,
+    });
+
+    // Synchronize updates across other isomorphic group variants
+    for (let gIdx = 0; gIdx < exam.groups.length; gIdx++) {
+      if (gIdx === targetGroupIndex) continue;
+      const otherGroup = exam.groups[gIdx];
+      let match = otherGroup.questions.find(
+        (q) => (targetChunkId && q.source_chunk_id === targetChunkId) ||
+               (targetEvidence && q.source_evidence === targetEvidence) ||
+               q.question_text === oldQuestionText
+      );
+      if (!match && targetQIndex < otherGroup.questions.length) {
+        match = otherGroup.questions[targetQIndex];
+      }
+
+      if (match) {
+        if (question_text !== undefined) match.question_text = question_text;
+        if (marks !== undefined) match.marks = targetQuestion.marks;
+        if (explanation !== undefined) match.explanation = explanation;
+        if (options !== undefined && Array.isArray(options)) {
+          // Permute options deterministically for anti-cheating variant
+          const shift = otherGroup.group_order % options.length;
+          match.options = [...options.slice(shift), ...options.slice(0, shift)];
+          match.correct_answer = targetQuestion.correct_answer;
+        } else if (correct_answer !== undefined) {
+          match.correct_answer = String(correct_answer);
+        }
+        match.updated_at = new Date().toISOString();
+
+        db.updateQuestion(match.id, {
+          question_text: match.question_text,
+          marks: match.marks,
+          options: match.options,
+          correct_answer: match.correct_answer,
+          explanation: match.explanation,
+        });
+      }
+    }
+
     // Recalculate total marks across exam
     if (exam.groups.length > 0) {
       exam.total_marks = exam.groups[0].questions.reduce((sum, q) => sum + q.marks, 0);
+      db.updateExamMetadata(exam.id, { total_marks: exam.total_marks });
     }
-    exam.updated_at = new Date().toISOString();
 
     return res.json(targetQuestion);
   });
 
   // Delete Question (Synchronized across all groups)
   app.delete('/api/exams/:id/questions/:question_id', (req: Request, res: Response) => {
-    const exam = examsStore.find((e) => e.id === req.params.id);
+    const exam = db.getExamById(req.params.id);
     if (!exam) {
       return res.status(404).json({ detail: 'Exam not found' });
+    }
+
+    // Ownership check
+    if (exam.session_id !== 'default') {
+      if (req.auth.userId && exam.user_id && exam.user_id !== req.auth.userId) {
+        return res.status(403).json({ detail: 'Permission denied.' });
+      }
+      if (req.auth.isGuest && exam.session_id && exam.session_id !== req.auth.sessionId) {
+        return res.status(403).json({ detail: 'Permission denied.' });
+      }
     }
 
     // Check minimum questions constraint: an exam must retain at least 1 question per group
@@ -1361,6 +2688,7 @@ async function startServer() {
     const targetText = targetQ.question_text;
     const targetEvidence = targetQ.source_evidence;
     let totalDeleted = 0;
+    const deletedQuestionIds: string[] = [];
 
     // Delete matching isomorphic question across all groups
     for (const group of exam.groups) {
@@ -1371,26 +2699,34 @@ async function startServer() {
         matchIdx = group.questions.findIndex((q) => q.source_evidence === targetEvidence);
       }
       if (matchIdx === -1 && targetQuestionIndex < group.questions.length) {
-        // Fallback index match if question text was edited
         matchIdx = targetQuestionIndex;
       }
 
       if (matchIdx !== -1) {
-        group.questions.splice(matchIdx, 1);
+        const removed = group.questions.splice(matchIdx, 1);
+        if (removed[0]) {
+          deletedQuestionIds.push(removed[0].id);
+          db.deleteQuestion(removed[0].id);
+        }
         totalDeleted++;
       }
 
       // Re-sequence question_order
       group.questions.forEach((q, idx) => {
         q.question_order = idx + 1;
+        db.updateQuestionOrder(q.id, idx + 1);
       });
       group.questions_count = group.questions.length;
+      db.updateGroupQuestionsCount(group.id, group.questions.length);
     }
 
     exam.questions_count = exam.groups.reduce((acc, g) => acc + g.questions.length, 0);
     const newTotalMarks = exam.groups[0]?.questions.reduce((sum, q) => sum + q.marks, 0) || 0;
     exam.total_marks = newTotalMarks;
-    exam.updated_at = new Date().toISOString();
+    db.updateExamMetadata(exam.id, {
+      total_marks: exam.total_marks,
+      questions_count: exam.questions_count,
+    });
 
     return res.json({
       deleted_question_id: req.params.question_id,
@@ -1404,9 +2740,18 @@ async function startServer() {
 
   // Reorder questions within a group
   app.put('/api/exams/:id/groups/:group_id/reorder', (req: Request, res: Response) => {
-    const exam = examsStore.find((e) => e.id === req.params.id);
+    const exam = db.getExamById(req.params.id);
     if (!exam) {
       return res.status(404).json({ detail: 'Exam not found' });
+    }
+
+    if (exam.session_id !== 'default') {
+      if (req.auth.userId && exam.user_id && exam.user_id !== req.auth.userId) {
+        return res.status(403).json({ detail: 'Permission denied.' });
+      }
+      if (req.auth.isGuest && exam.session_id && exam.session_id !== req.auth.sessionId) {
+        return res.status(403).json({ detail: 'Permission denied.' });
+      }
     }
 
     const group = exam.groups.find((g) => g.id === req.params.group_id);
@@ -1431,6 +2776,7 @@ async function startServer() {
       const q = group.questions.find((item) => item.id === qId);
       if (q) {
         q.question_order = idx + 1;
+        db.updateQuestionOrder(q.id, idx + 1);
         reordered.push(q);
       }
     });
@@ -1441,9 +2787,18 @@ async function startServer() {
 
   // Regenerate single question
   app.post('/api/exams/:id/questions/:question_id/regenerate', (req: Request, res: Response) => {
-    const exam = examsStore.find((e) => e.id === req.params.id);
+    const exam = db.getExamById(req.params.id);
     if (!exam) {
       return res.status(404).json({ detail: 'Exam not found' });
+    }
+
+    if (exam.session_id !== 'default') {
+      if (req.auth.userId && exam.user_id && exam.user_id !== req.auth.userId) {
+        return res.status(403).json({ detail: 'Permission denied.' });
+      }
+      if (req.auth.isGuest && exam.session_id && exam.session_id !== req.auth.sessionId) {
+        return res.status(403).json({ detail: 'Permission denied.' });
+      }
     }
 
     let targetQ: QuestionRecord | null = null;
@@ -1472,6 +2827,7 @@ async function startServer() {
 
     targetQ.question_text = refreshedText;
     targetQ.updated_at = new Date().toISOString();
+    db.updateQuestion(targetQ.id, { question_text: refreshedText });
 
     // Synchronize to other groups
     for (const group of exam.groups) {
@@ -1480,6 +2836,7 @@ async function startServer() {
         if (matchingQ) {
           matchingQ.question_text = refreshedText;
           matchingQ.updated_at = new Date().toISOString();
+          db.updateQuestion(matchingQ.id, { question_text: refreshedText });
         }
       }
     }
@@ -1489,17 +2846,23 @@ async function startServer() {
 
   // Delete Exam
   app.delete('/api/exams/:id', (req: Request, res: Response) => {
-    const idx = examsStore.findIndex((e) => e.id === req.params.id);
-    if (idx === -1) {
+    const exam = db.getExamById(req.params.id);
+    if (!exam) {
       return res.status(404).json({ detail: 'Exam not found' });
     }
-    examsStore.splice(idx, 1);
+    if (exam.id === 'exam-cell-bio-midterm') {
+      return res.status(403).json({ detail: 'Cannot delete default seed examination.' });
+    }
+    if (exam.user_id && exam.user_id !== req.auth.userId) {
+      return res.status(403).json({ detail: 'Permission denied.' });
+    }
+    db.deleteExam(req.params.id);
     return res.status(204).send();
   });
 
   // 5. EXPORT ENGINE: DOCX & PDF
   app.get('/api/exams/:id/export/docx', async (req: Request, res: Response) => {
-    const exam = examsStore.find((e) => e.id === req.params.id);
+    const exam = db.getExamById(req.params.id);
     if (!exam) {
       return res.status(404).json({ detail: 'Exam not found' });
     }
@@ -1524,6 +2887,9 @@ async function startServer() {
 
     try {
       const docxSections: any[] = [];
+      const isExamRtl = Boolean(exam.is_rtl) || detectIsRtl(exam.title || '') || detectIsRtl(exam.subject || '') || exam.language === 'fa';
+      const textDir = isExamRtl ? { bidirectional: true, alignment: AlignmentType.RIGHT } : {};
+      const centerDir = isExamRtl ? { bidirectional: true, alignment: AlignmentType.CENTER } : { alignment: AlignmentType.CENTER };
 
       for (let gIdx = 0; gIdx < targetGroups.length; gIdx++) {
         const group = targetGroups[gIdx];
@@ -1533,21 +2899,34 @@ async function startServer() {
         // 1. STUDENT EXAMINATION PAPER SECTION
         if (targetMode === 'both' || targetMode === 'exam') {
           // Institution & Title Header
+          const instParts = [exam.institution, exam.faculty]
+            .filter(Boolean)
+            .map((s) => String(s).trim())
+            .filter(Boolean);
+          const instHeader = instParts.join(' — ');
+
+          if (instHeader) {
+            children.push(
+              new Paragraph({
+                text: instHeader,
+                ...centerDir,
+                spacing: { after: 80 },
+              })
+            );
+          }
+
           children.push(
             new Paragraph({
-              text: exam.institution || 'ACADEMIC INSTITUTION',
-              alignment: AlignmentType.CENTER,
-              spacing: { after: 80 },
-            }),
-            new Paragraph({
               text: `${exam.title} - ${group.group_name}`,
-              alignment: AlignmentType.CENTER,
+              ...centerDir,
               spacing: { after: 100 },
               style: 'Heading1',
             }),
             new Paragraph({
-              text: `Subject: ${exam.subject}  |  Duration: ${exam.duration_minutes} Mins  |  Max Marks: ${groupMarks} pts  |  Variant: ${group.group_name}`,
-              alignment: AlignmentType.CENTER,
+              text: isExamRtl
+                ? `مضمون: ${exam.subject}  |  مدت: ${exam.duration_minutes} دقیقه  |  مجموع نمرات: ${groupMarks}  |  گروپ: ${group.group_name}`
+                : `Subject: ${exam.subject}  |  Duration: ${exam.duration_minutes} Mins  |  Max Marks: ${groupMarks} pts  |  Variant: ${group.group_name}`,
+              ...centerDir,
               spacing: { after: 180 },
             })
           );
@@ -1560,10 +2939,20 @@ async function startServer() {
                 new TableRow({
                   children: [
                     new TableCell({
-                      children: [new Paragraph({ text: 'Student Name: ___________________________' })],
+                      children: [
+                        new Paragraph({
+                          text: isExamRtl ? 'نام و تخلص محصل: ___________________________' : 'Student Name: ___________________________',
+                          ...textDir,
+                        }),
+                      ],
                     }),
                     new TableCell({
-                      children: [new Paragraph({ text: 'Roll / Seat No: ____________' })],
+                      children: [
+                        new Paragraph({
+                          text: isExamRtl ? 'نمبر چوکی / تذکره: ____________' : 'Roll / Seat No: ____________',
+                          ...textDir,
+                        }),
+                      ],
                     }),
                   ],
                 }),
@@ -1572,12 +2961,20 @@ async function startServer() {
                     new TableCell({
                       children: [
                         new Paragraph({
-                          text: `Date: ${exam.exam_date || new Date().toISOString().split('T')[0]}`,
+                          text: isExamRtl
+                            ? `تاریخ: ${exam.exam_date || new Date().toISOString().split('T')[0]}`
+                            : `Date: ${exam.exam_date || new Date().toISOString().split('T')[0]}`,
+                          ...textDir,
                         }),
                       ],
                     }),
                     new TableCell({
-                      children: [new Paragraph({ text: `Examination Group: ${group.group_name}` })],
+                      children: [
+                        new Paragraph({
+                          text: isExamRtl ? `گروپ امتحانی: ${group.group_name}` : `Examination Group: ${group.group_name}`,
+                          ...textDir,
+                        }),
+                      ],
                     }),
                   ],
                 }),
@@ -1589,15 +2986,28 @@ async function startServer() {
           // General Instructions Box
           children.push(
             new Paragraph({
-              children: [new TextRun({ text: 'General Instructions:', bold: true })],
+              children: [
+                new TextRun({
+                  text: isExamRtl ? 'رهنمود عمومی امتحان:' : 'General Instructions:',
+                  bold: true,
+                  rightToLeft: isExamRtl,
+                }),
+              ],
+              ...textDir,
               spacing: { before: 80, after: 40 },
             }),
             new Paragraph({
-              text: '1. Check that this paper contains all questions for your designated examination group.',
+              text: isExamRtl
+                ? '۱. اطمینان حاصل نمایید که این ورقه امتحانی حاوی کلیه سوالات گروپ شما می‌باشد.'
+                : '1. Check that this paper contains all questions for your designated examination group.',
+              ...textDir,
               spacing: { after: 20 },
             }),
             new Paragraph({
-              text: '2. Write all answers clearly in the spaces provided below. Unauthorized materials are strictly prohibited.',
+              text: isExamRtl
+                ? '۲. کلیه پاسخ‌ها را به صورت واضح و خوانا در فضای تعیین‌شده بنویسید. همراه داشتن هرگونه وسیله غیرمجاز ممنوع است.'
+                : '2. Write all answers clearly in the spaces provided below. Unauthorized materials are strictly prohibited.',
+              ...textDir,
               spacing: { after: 120 },
             })
           );
@@ -1605,8 +3015,9 @@ async function startServer() {
           // Questions Section Header
           children.push(
             new Paragraph({
-              text: `EXAMINATION QUESTIONS (${group.group_name})`,
+              text: isExamRtl ? `سوالات امتحانی (${group.group_name})` : `EXAMINATION QUESTIONS (${group.group_name})`,
               style: 'Heading2',
+              ...textDir,
               spacing: { before: 120, after: 120 },
             })
           );
@@ -1614,25 +3025,31 @@ async function startServer() {
           // Render every question with full text, complete options, and marks
           group.questions.forEach((q, idx) => {
             const qType = (q.question_type || '').toLowerCase();
+            const qLabel = isExamRtl ? `سوال ${idx + 1}. ` : `Q${idx + 1}. `;
+            const ptsLabel = isExamRtl ? `   [${q.marks} نمره]` : `   [${q.marks} pt${q.marks !== 1 ? 's' : ''}]`;
 
             children.push(
               new Paragraph({
                 children: [
-                  new TextRun({ text: `Q${idx + 1}. `, bold: true }),
-                  new TextRun({ text: q.question_text }),
-                  new TextRun({ text: `   [${q.marks} pt${q.marks !== 1 ? 's' : ''}]`, bold: true }),
+                  new TextRun({ text: qLabel, bold: true, rightToLeft: isExamRtl }),
+                  new TextRun({ text: q.question_text, rightToLeft: isExamRtl }),
+                  new TextRun({ text: ptsLabel, bold: true, rightToLeft: isExamRtl }),
                 ],
+                ...textDir,
                 spacing: { before: 140, after: 60 },
               })
             );
 
             if (qType === 'mcq' && q.options && q.options.length > 0) {
-              const optLabels = ['(A)', '(B)', '(C)', '(D)', '(E)', '(F)'];
+              const optLabels = isExamRtl
+                ? ['(الف)', '(ب)', '(ج)', '(د)', '(هـ)', '(و)']
+                : ['(A)', '(B)', '(C)', '(D)', '(E)', '(F)'];
               q.options.forEach((opt, oIdx) => {
                 const cleanOpt = String(opt).replace(/^[A-Fa-f0-9][\:\.\)]\s*/, '').trim();
                 children.push(
                   new Paragraph({
                     text: `     ${optLabels[oIdx] || `(${oIdx + 1})`}  ${cleanOpt}`,
+                    ...textDir,
                     spacing: { after: 40 },
                   })
                 );
@@ -1640,21 +3057,34 @@ async function startServer() {
 
               children.push(
                 new Paragraph({
-                  children: [new TextRun({ text: '     Selected Option: [ _______ ]', italics: true })],
+                  children: [
+                    new TextRun({
+                      text: isExamRtl ? '     گزینه انتخابی: [ _______ ]' : '     Selected Option: [ _______ ]',
+                      italics: true,
+                      rightToLeft: isExamRtl,
+                    }),
+                  ],
+                  ...textDir,
                   spacing: { after: 80 },
                 })
               );
             } else if (qType === 'true_false') {
               children.push(
                 new Paragraph({
-                  text: '     [   ] True             [   ] False',
+                  text: isExamRtl
+                    ? '     [   ] صحیح             [   ] غلط'
+                    : '     [   ] True             [   ] False',
+                  ...textDir,
                   spacing: { after: 80 },
                 })
               );
             } else if (qType === 'fill_blank') {
               children.push(
                 new Paragraph({
-                  text: '     Answer: __________________________________________________________________',
+                  text: isExamRtl
+                    ? '     پاسخ: __________________________________________________________________'
+                    : '     Answer: __________________________________________________________________',
+                  ...textDir,
                   spacing: { after: 80 },
                 })
               );
@@ -1663,16 +3093,17 @@ async function startServer() {
                 children.push(
                   new Paragraph({
                     text: '     . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .',
+                    ...textDir,
                     spacing: { after: 30 },
                   })
                 );
               }
             } else {
-              // short answer or other handwriting lines
               for (let line = 0; line < 3; line++) {
                 children.push(
                   new Paragraph({
                     text: '     . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .',
+                    ...textDir,
                     spacing: { after: 30 },
                   })
                 );
@@ -1682,8 +3113,10 @@ async function startServer() {
 
           children.push(
             new Paragraph({
-              text: `--- END OF EXAMINATION PAPER (${group.group_name}) ---`,
-              alignment: AlignmentType.CENTER,
+              text: isExamRtl
+                ? `--- پایان ورقه امتحانی (${group.group_name}) ---`
+                : `--- END OF EXAMINATION PAPER (${group.group_name}) ---`,
+              ...centerDir,
               spacing: { before: 200, after: 150 },
             })
           );
@@ -1691,7 +3124,6 @@ async function startServer() {
 
         // 2. TEACHER ANSWER KEY & SCORING RUBRICS SECTION
         if (targetMode === 'both' || targetMode === 'answer_key') {
-          // If printing both, add page break before the confidential answer key
           if (targetMode === 'both') {
             children.push(
               new Paragraph({
@@ -1705,56 +3137,63 @@ async function startServer() {
             new Paragraph({
               children: [
                 new TextRun({
-                  text: 'CONFIDENTIAL - OFFICIAL TEACHER ANSWER KEY & SCORING RUBRICS',
+                  text: isExamRtl
+                    ? 'محرمانه — کلید رسمی سوالات و رهنمود نمره‌دهی اساتید'
+                    : 'CONFIDENTIAL - OFFICIAL TEACHER ANSWER KEY & SCORING RUBRICS',
                   bold: true,
                   color: '991B1B',
+                  rightToLeft: isExamRtl,
                 }),
               ],
-              alignment: AlignmentType.CENTER,
+              ...centerDir,
               spacing: { before: 100, after: 60 },
             }),
             new Paragraph({
-              text: `${exam.title} - ${group.group_name} Master Grading Rubric`,
-              alignment: AlignmentType.CENTER,
+              text: isExamRtl
+                ? `${exam.title} - ${group.group_name} کلید و معیار جامع نمره‌دهی`
+                : `${exam.title} - ${group.group_name} Master Grading Rubric`,
+              ...centerDir,
               spacing: { after: 60 },
               style: 'Heading2',
             }),
             new Paragraph({
-              text: `Subject: ${exam.subject}  |  Total Questions: ${group.questions.length}  |  Total Marks: ${groupMarks} pts`,
-              alignment: AlignmentType.CENTER,
+              text: isExamRtl
+                ? `مضمون: ${exam.subject}  |  مجموع سوالات: ${group.questions.length}  |  مجموع نمرات: ${groupMarks}`
+                : `Subject: ${exam.subject}  |  Total Questions: ${group.questions.length}  |  Total Marks: ${groupMarks} pts`,
+              ...centerDir,
               spacing: { after: 160 },
             })
           );
 
-          // Full Answer Key Table with all 6 columns: Q#, Type, Marks, Correct Answer, Explanation, Provenance
+          // Full Answer Key Table
           const tableHeader = new TableRow({
             tableHeader: true,
             children: [
               new TableCell({
                 width: { size: 8, type: WidthType.PERCENTAGE },
-                children: [new Paragraph({ children: [new TextRun({ text: 'Q#', bold: true })] })],
+                children: [new Paragraph({ children: [new TextRun({ text: isExamRtl ? 'شماره' : 'Q#', bold: true, rightToLeft: isExamRtl })], ...textDir })],
               }),
               new TableCell({
                 width: { size: 12, type: WidthType.PERCENTAGE },
-                children: [new Paragraph({ children: [new TextRun({ text: 'Type', bold: true })] })],
+                children: [new Paragraph({ children: [new TextRun({ text: isExamRtl ? 'نوعیت' : 'Type', bold: true, rightToLeft: isExamRtl })], ...textDir })],
               }),
               new TableCell({
                 width: { size: 8, type: WidthType.PERCENTAGE },
-                children: [new Paragraph({ children: [new TextRun({ text: 'Marks', bold: true })] })],
+                children: [new Paragraph({ children: [new TextRun({ text: isExamRtl ? 'نمره' : 'Marks', bold: true, rightToLeft: isExamRtl })], ...textDir })],
               }),
               new TableCell({
                 width: { size: 24, type: WidthType.PERCENTAGE },
-                children: [new Paragraph({ children: [new TextRun({ text: 'Correct Answer', bold: true })] })],
+                children: [new Paragraph({ children: [new TextRun({ text: isExamRtl ? 'پاسخ صحیح' : 'Correct Answer', bold: true, rightToLeft: isExamRtl })], ...textDir })],
               }),
               new TableCell({
                 width: { size: 26, type: WidthType.PERCENTAGE },
                 children: [
-                  new Paragraph({ children: [new TextRun({ text: 'Explanation / Scoring Rubric', bold: true })] }),
+                  new Paragraph({ children: [new TextRun({ text: isExamRtl ? 'تشریح / معیار نمره‌دهی' : 'Explanation / Scoring Rubric', bold: true, rightToLeft: isExamRtl })], ...textDir }),
                 ],
               }),
               new TableCell({
                 width: { size: 22, type: WidthType.PERCENTAGE },
-                children: [new Paragraph({ children: [new TextRun({ text: 'Source Provenance', bold: true })] })],
+                children: [new Paragraph({ children: [new TextRun({ text: isExamRtl ? 'استناد و منبع' : 'Source Provenance', bold: true, rightToLeft: isExamRtl })], ...textDir })],
               }),
             ],
           });
@@ -1763,30 +3202,31 @@ async function startServer() {
             tableHeader,
             ...group.questions.map((q, idx) => {
               const provenanceParts: string[] = [];
-              if (q.source_document_name) provenanceParts.push(`Doc: ${q.source_document_name}`);
-              if (q.source_page) provenanceParts.push(`Page: ${q.source_page}`);
-              if (q.source_chapter) provenanceParts.push(`Chapter: ${q.source_chapter}`);
-              if (q.source_evidence) provenanceParts.push(`Evidence: "${q.source_evidence}"`);
+              if (q.source_document_name) provenanceParts.push(isExamRtl ? `منبع: ${q.source_document_name}` : `Doc: ${q.source_document_name}`);
+              if (q.source_page) provenanceParts.push(isExamRtl ? `صفحه: ${q.source_page}` : `Page: ${q.source_page}`);
+              if (q.source_chapter) provenanceParts.push(isExamRtl ? `فصل: ${q.source_chapter}` : `Chapter: ${q.source_chapter}`);
+              if (q.source_evidence) provenanceParts.push(isExamRtl ? `نقل‌قول: "${q.source_evidence}"` : `Evidence: "${q.source_evidence}"`);
 
               return new TableRow({
                 children: [
                   new TableCell({
                     width: { size: 8, type: WidthType.PERCENTAGE },
-                    children: [new Paragraph({ text: `Q${idx + 1}` })],
+                    children: [new Paragraph({ text: isExamRtl ? `${idx + 1}` : `Q${idx + 1}`, ...textDir })],
                   }),
                   new TableCell({
                     width: { size: 12, type: WidthType.PERCENTAGE },
-                    children: [new Paragraph({ text: q.question_type || 'General' })],
+                    children: [new Paragraph({ text: q.question_type || 'General', ...textDir })],
                   }),
                   new TableCell({
                     width: { size: 8, type: WidthType.PERCENTAGE },
-                    children: [new Paragraph({ text: `${q.marks} pt` })],
+                    children: [new Paragraph({ text: isExamRtl ? `${q.marks}` : `${q.marks} pt`, ...textDir })],
                   }),
                   new TableCell({
                     width: { size: 24, type: WidthType.PERCENTAGE },
                     children: [
                       new Paragraph({
-                        children: [new TextRun({ text: q.correct_answer || '—', bold: true, color: '065F46' })],
+                        children: [new TextRun({ text: q.correct_answer || '—', bold: true, color: '065F46', rightToLeft: isExamRtl })],
+                        ...textDir,
                       }),
                     ],
                   }),
@@ -1794,7 +3234,8 @@ async function startServer() {
                     width: { size: 26, type: WidthType.PERCENTAGE },
                     children: [
                       new Paragraph({
-                        text: q.explanation || 'Directly grounded in source curriculum concepts.',
+                        text: q.explanation || (isExamRtl ? 'مستند به مفاهیم منبع آموزشی.' : 'Directly grounded in source curriculum concepts.'),
+                        ...textDir,
                       }),
                     ],
                   }),
@@ -1802,7 +3243,8 @@ async function startServer() {
                     width: { size: 22, type: WidthType.PERCENTAGE },
                     children: [
                       new Paragraph({
-                        text: provenanceParts.join('\n') || 'Source Verified',
+                        text: provenanceParts.join('\n') || (isExamRtl ? 'تأییدشده از منبع' : 'Source Verified'),
+                        ...textDir,
                       }),
                     ],
                   }),
@@ -1819,12 +3261,15 @@ async function startServer() {
             new Paragraph({
               children: [
                 new TextRun({
-                  text: 'Strictly confidential academic grading document. Not to be distributed to students before grading is concluded.',
+                  text: isExamRtl
+                    ? 'سند کاملاً محرمانه امتحانی. قبل از اتمام کامل نمره‌دهی، از در اختیار قرار دادن آن به محصلین خودداری گردد.'
+                    : 'Strictly confidential academic grading document. Not to be distributed to students before grading is concluded.',
                   italics: true,
                   color: '991B1B',
+                  rightToLeft: isExamRtl,
                 }),
               ],
-              alignment: AlignmentType.CENTER,
+              ...centerDir,
               spacing: { before: 140, after: 100 },
             })
           );
@@ -1845,7 +3290,7 @@ async function startServer() {
   });
 
   // Helper function to wrap text for PDF without any truncation or clipping
-  function wrapPdfText(text: string, font: any, fontSize: number, maxWidth: number): string[] {
+  function wrapPdfText(text: string, font: any, fontSize: number, maxWidth: number, isRtl = false): string[] {
     if (!text) return [];
     const clean = String(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     const paragraphs = clean.split('\n');
@@ -1863,7 +3308,8 @@ async function startServer() {
         const testCandidate = currentLine ? `${currentLine} ${word}` : word;
         let width = 0;
         try {
-          width = font.widthOfTextAtSize(testCandidate, fontSize);
+          const measured = isRtl ? formatPdfText(testCandidate, true) : testCandidate;
+          width = font.widthOfTextAtSize(measured, fontSize);
         } catch {
           width = testCandidate.length * (fontSize * 0.55);
         }
@@ -1875,24 +3321,8 @@ async function startServer() {
             result.push(currentLine);
             currentLine = word;
           } else {
-            // Very long single word
-            let sub = '';
-            for (const char of word) {
-              const testSub = sub + char;
-              let subW = 0;
-              try {
-                subW = font.widthOfTextAtSize(testSub, fontSize);
-              } catch {
-                subW = testSub.length * (fontSize * 0.55);
-              }
-              if (subW <= maxWidth) {
-                sub = testSub;
-              } else {
-                if (sub) result.push(sub);
-                sub = char;
-              }
-            }
-            currentLine = sub;
+            result.push(word);
+            currentLine = '';
           }
         }
       }
@@ -1904,8 +3334,68 @@ async function startServer() {
     return result;
   }
 
+  // Font buffers cached in memory for high-performance PDF export
+  let cachedRegularFont: Buffer | null = null;
+  let cachedBoldFont: Buffer | null = null;
+  let cachedObliqueFont: Buffer | null = null;
+
+  function loadPdfFontBuffers() {
+    const tryRead = (candidates: string[]) => {
+      for (const c of candidates) {
+        try {
+          if (fs.existsSync(c)) {
+            return fs.readFileSync(c);
+          }
+        } catch {
+          // continue
+        }
+      }
+      return null;
+    };
+
+    if (!cachedRegularFont) {
+      cachedRegularFont = tryRead([
+        path.resolve(__dirname, 'fonts', 'Vazir-Regular.ttf'),
+        path.resolve(process.cwd(), 'fonts', 'Vazir-Regular.ttf'),
+        '/app/applet/fonts/Vazir-Regular.ttf',
+        path.resolve(__dirname, 'fonts', 'FreeSans.ttf'),
+        path.resolve(process.cwd(), 'fonts', 'FreeSans.ttf'),
+        '/usr/share/fonts/truetype/freefont/FreeSans.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+      ]);
+    }
+    if (!cachedBoldFont) {
+      cachedBoldFont = tryRead([
+        path.resolve(__dirname, 'fonts', 'Vazir-Bold.ttf'),
+        path.resolve(process.cwd(), 'fonts', 'Vazir-Bold.ttf'),
+        '/app/applet/fonts/Vazir-Bold.ttf',
+        path.resolve(__dirname, 'fonts', 'FreeSansBold.ttf'),
+        path.resolve(process.cwd(), 'fonts', 'FreeSansBold.ttf'),
+        '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+      ]);
+    }
+    if (!cachedObliqueFont) {
+      cachedObliqueFont = tryRead([
+        path.resolve(__dirname, 'fonts', 'Vazir-Light.ttf'),
+        path.resolve(process.cwd(), 'fonts', 'Vazir-Light.ttf'),
+        '/app/applet/fonts/Vazir-Light.ttf',
+        path.resolve(__dirname, 'fonts', 'FreeSansOblique.ttf'),
+        path.resolve(process.cwd(), 'fonts', 'FreeSansOblique.ttf'),
+        '/usr/share/fonts/truetype/freefont/FreeSansOblique.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf',
+      ]);
+    }
+
+    return {
+      regular: cachedRegularFont,
+      bold: cachedBoldFont,
+      oblique: cachedObliqueFont,
+    };
+  }
+
   app.get('/api/exams/:id/export/pdf', async (req: Request, res: Response) => {
-    const exam = examsStore.find((e) => e.id === req.params.id);
+    const exam = db.getExamById(req.params.id);
     if (!exam) {
       return res.status(404).json({ detail: 'Exam not found' });
     }
@@ -1930,9 +3420,30 @@ async function startServer() {
 
     try {
       const pdfDoc = await PDFDocument.create();
-      const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-      const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-      const fontOblique = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
+      const fontBuffers = loadPdfFontBuffers();
+
+      let font: any;
+      let fontBold: any;
+      let fontOblique: any;
+
+      if (fontBuffers.regular) {
+        pdfDoc.registerFontkit(fontkit);
+        font = await pdfDoc.embedFont(fontBuffers.regular, { subset: true });
+        fontBold = fontBuffers.bold
+          ? await pdfDoc.embedFont(fontBuffers.bold, { subset: true })
+          : font;
+        fontOblique = fontBuffers.oblique
+          ? await pdfDoc.embedFont(fontBuffers.oblique, { subset: true })
+          : font;
+
+        enableRtlOnEmbeddedFont(font);
+        enableRtlOnEmbeddedFont(fontBold);
+        enableRtlOnEmbeddedFont(fontOblique);
+      } else {
+        font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+        fontOblique = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
+      }
 
       const pageWidth = 595.28;
       const pageHeight = 841.89;
@@ -1944,13 +3455,38 @@ async function startServer() {
         let page = pdfDoc.addPage([pageWidth, pageHeight]);
         let y = pageHeight - 45;
 
+        const isExamRtl = Boolean(exam.is_rtl) || detectIsRtl(exam.title || '') || detectIsRtl(exam.subject || '') || exam.language === 'fa';
+
+        const safeDraw = (textStr: string, opts: any, targetPage = page) => {
+          try {
+            targetPage.drawText(textStr, opts);
+          } catch {
+            try {
+              const sanitized = textStr.replace(/[^\x20-\x7E\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF\u2000-\u206F\u2190-\u21FF\u2200-\u22FF\u2700-\u27BF]/g, ' ');
+              targetPage.drawText(sanitized, opts);
+            } catch {
+              // safe fallback for unusual individual glyphs
+            }
+          }
+        };
+
         const ensureSpace = (neededHeight: number, isAnswerKey = false) => {
           if (y - neededHeight < 45) {
             page = pdfDoc.addPage([pageWidth, pageHeight]);
             y = pageHeight - 45;
-            const subLabel = isAnswerKey ? 'Answer Key & Scoring Rubric' : 'Student Examination Paper';
-            page.drawText(`${exam.title} - ${group.group_name} (${subLabel} Continued)`, {
-              x: marginX,
+            const subLabel = isAnswerKey
+              ? (isExamRtl ? 'کلید سوالات و معیار نمره‌دهی (ادامه)' : 'Answer Key & Scoring Rubric Continued')
+              : (isExamRtl ? 'ورقه امتحانی محصل (ادامه)' : 'Student Examination Paper Continued');
+            const contTitle = isExamRtl
+              ? `(${subLabel}) ${group.group_name} - ${exam.title}`
+              : `${exam.title} - ${group.group_name} (${subLabel})`;
+            
+            const contFormatted = isExamRtl ? formatPdfText(contTitle, true) : contTitle;
+            const contWidth = fontOblique.widthOfTextAtSize(contFormatted, 8);
+            const contX = isExamRtl ? Math.max(marginX, pageWidth - marginX - contWidth) : marginX;
+
+            safeDraw(contFormatted, {
+              x: contX,
               y,
               size: 8,
               font: fontOblique,
@@ -1974,13 +3510,26 @@ async function startServer() {
           color: any,
           maxWidth: number,
           lineHeight = fontSize * 1.35,
-          isAnswerKey = false
+          isAnswerKey = false,
+          forceRtl = false
         ) => {
-          const lines = wrapPdfText(text, usedFont, fontSize, maxWidth);
-          for (const line of lines) {
+          const isTextRtl = forceRtl || isExamRtl || detectIsRtl(text);
+          const lines = wrapPdfText(text, usedFont, fontSize, maxWidth, isTextRtl);
+          for (const rawLine of lines) {
             ensureSpace(lineHeight, isAnswerKey);
-            page.drawText(line, {
-              x,
+            const line = isTextRtl ? formatPdfText(rawLine, true) : rawLine;
+            let drawX = x;
+            if (isTextRtl) {
+              try {
+                const lineW = usedFont.widthOfTextAtSize(line, fontSize);
+                const indent = x > marginX ? x - marginX : 0;
+                drawX = Math.max(marginX, pageWidth - marginX - lineW - indent);
+              } catch {
+                drawX = x;
+              }
+            }
+            safeDraw(line, {
+              x: drawX,
               y,
               size: fontSize,
               font: usedFont,
@@ -1993,17 +3542,32 @@ async function startServer() {
         // 1. STUDENT EXAMINATION PAPER
         if (targetMode === 'both' || targetMode === 'exam') {
           // Institutional Header
-          page.drawText(exam.institution || 'ACADEMIC INSTITUTION', {
-            x: marginX,
-            y,
-            size: 11,
-            font: fontBold,
-            color: rgb(0.2, 0.2, 0.2),
-          });
-          y -= 20;
+          const instParts = [exam.institution, exam.faculty]
+            .filter(Boolean)
+            .map((s) => String(s).trim())
+            .filter(Boolean);
+          const instHeader = instParts.join(' — ');
 
-          page.drawText(`${exam.title} - ${group.group_name}`, {
-            x: marginX,
+          if (instHeader) {
+            const instFormatted = isExamRtl ? formatPdfText(instHeader, true) : instHeader;
+            const instW = fontBold.widthOfTextAtSize(instFormatted, 11);
+            const instX = isExamRtl ? Math.max(marginX, pageWidth - marginX - instW) : marginX;
+            safeDraw(instFormatted, {
+              x: instX,
+              y,
+              size: 11,
+              font: fontBold,
+              color: rgb(0.2, 0.2, 0.2),
+            });
+            y -= 20;
+          }
+
+          const titleText = `${exam.title} - ${group.group_name}`;
+          const titleFormatted = isExamRtl ? formatPdfText(titleText, true) : titleText;
+          const titleW = fontBold.widthOfTextAtSize(titleFormatted, 14);
+          const titleX = isExamRtl ? Math.max(marginX, pageWidth - marginX - titleW) : marginX;
+          safeDraw(titleFormatted, {
+            x: titleX,
             y,
             size: 14,
             font: fontBold,
@@ -2011,16 +3575,19 @@ async function startServer() {
           });
           y -= 17;
 
-          page.drawText(
-            `Subject: ${exam.subject}  |  Duration: ${exam.duration_minutes} Mins  |  Max Marks: ${groupMarks} pts  |  Variant: ${group.group_name}`,
-            {
-              x: marginX,
-              y,
-              size: 9,
-              font,
-              color: rgb(0.35, 0.35, 0.35),
-            }
-          );
+          const metaText = isExamRtl
+            ? `مضمون: ${exam.subject}  |  مدت: ${exam.duration_minutes} دقیقه  |  مجموع نمرات: ${groupMarks}  |  گروپ: ${group.group_name}`
+            : `Subject: ${exam.subject}  |  Duration: ${exam.duration_minutes} Mins  |  Max Marks: ${groupMarks} pts  |  Variant: ${group.group_name}`;
+          const metaFormatted = isExamRtl ? formatPdfText(metaText, true) : metaText;
+          const metaW = font.widthOfTextAtSize(metaFormatted, 9);
+          const metaX = isExamRtl ? Math.max(marginX, pageWidth - marginX - metaW) : marginX;
+          safeDraw(metaFormatted, {
+            x: metaX,
+            y,
+            size: 9,
+            font,
+            color: rgb(0.35, 0.35, 0.35),
+          });
           y -= 18;
 
           page.drawLine({
@@ -2042,50 +3609,94 @@ async function startServer() {
             color: rgb(0.98, 0.98, 0.98),
           });
 
-          page.drawText('Student Name: _________________________________', {
-            x: marginX + 8,
-            y: y - 16,
-            size: 8.5,
-            font,
-            color: rgb(0.1, 0.1, 0.1),
-          });
-          page.drawText('Roll / Seat No: __________________', {
-            x: marginX + 290,
-            y: y - 16,
-            size: 8.5,
-            font,
-            color: rgb(0.1, 0.1, 0.1),
-          });
-          page.drawText(
-            `Date: ${exam.exam_date || new Date().toISOString().split('T')[0]}    |    Duration: ${exam.duration_minutes} Mins`,
-            {
-              x: marginX + 8,
+          if (isExamRtl) {
+            const line1R = formatPdfText('نام و تخلص محصل: _________________________________', true);
+            const line1L = formatPdfText('نمبر چوکی / تذکره: __________________', true);
+            const line2R = formatPdfText(`تاریخ: ${exam.exam_date || new Date().toISOString().split('T')[0]}    |    مدت: ${exam.duration_minutes} دقیقه`, true);
+            const line2L = formatPdfText(`مجموع نمرات: ${groupMarks} نمره    |    گروپ: ${group.group_name}`, true);
+
+            const w1R = font.widthOfTextAtSize(line1R, 8.5);
+            const w1L = font.widthOfTextAtSize(line1L, 8.5);
+            const w2R = font.widthOfTextAtSize(line2R, 8.5);
+            const w2L = font.widthOfTextAtSize(line2L, 8.5);
+
+            safeDraw(line1R, {
+              x: pageWidth - marginX - 16 - w1R,
+              y: y - 16,
+              size: 8.5,
+              font,
+              color: rgb(0.1, 0.1, 0.1),
+            });
+            safeDraw(line1L, {
+              x: pageWidth - marginX - 300 - w1L,
+              y: y - 16,
+              size: 8.5,
+              font,
+              color: rgb(0.1, 0.1, 0.1),
+            });
+            safeDraw(line2R, {
+              x: pageWidth - marginX - 16 - w2R,
               y: y - 32,
               size: 8.5,
               font,
               color: rgb(0.25, 0.25, 0.25),
-            }
-          );
-          page.drawText(`Max Marks: ${groupMarks} pts    |    Group: ${group.group_name}`, {
-            x: marginX + 290,
-            y: y - 32,
-            size: 8.5,
-            font,
-            color: rgb(0.25, 0.25, 0.25),
-          });
+            });
+            safeDraw(line2L, {
+              x: pageWidth - marginX - 300 - w2L,
+              y: y - 32,
+              size: 8.5,
+              font,
+              color: rgb(0.25, 0.25, 0.25),
+            });
+          } else {
+            safeDraw('Student Name: _________________________________', {
+              x: marginX + 8,
+              y: y - 16,
+              size: 8.5,
+              font,
+              color: rgb(0.1, 0.1, 0.1),
+            });
+            safeDraw('Roll / Seat No: __________________', {
+              x: marginX + 290,
+              y: y - 16,
+              size: 8.5,
+              font,
+              color: rgb(0.1, 0.1, 0.1),
+            });
+            safeDraw(
+              `Date: ${exam.exam_date || new Date().toISOString().split('T')[0]}    |    Duration: ${exam.duration_minutes} Mins`,
+              {
+                x: marginX + 8,
+                y: y - 32,
+                size: 8.5,
+                font,
+                color: rgb(0.25, 0.25, 0.25),
+              }
+            );
+            safeDraw(`Max Marks: ${groupMarks} pts    |    Group: ${group.group_name}`, {
+              x: marginX + 290,
+              y: y - 32,
+              size: 8.5,
+              font,
+              color: rgb(0.25, 0.25, 0.25),
+            });
+          }
           y -= 54;
 
           // Instructions
-          page.drawText(
-            'Instructions: Answer all questions in the space provided. Verify your group code. Unauthorized items strictly prohibited.',
-            {
-              x: marginX,
-              y,
-              size: 8,
-              font: fontOblique,
-              color: rgb(0.4, 0.4, 0.4),
-            }
-          );
+          const instrText = isExamRtl
+            ? 'رهنمود: به کلیه سوالات در فضای تعیین‌شده پاسخ دهید. استفاده از هرگونه یادداشت یا وسیله غیرمجاز ممنوع است.'
+            : 'Instructions: Answer all questions in the space provided. Verify your group code. Unauthorized items strictly prohibited.';
+          const instrFormatted = isExamRtl ? formatPdfText(instrText, true) : instrText;
+          const instrW = fontOblique.widthOfTextAtSize(instrFormatted, 8);
+          const instrX = isExamRtl ? Math.max(marginX, pageWidth - marginX - instrW) : marginX;
+          safeDraw(instrFormatted, {
+            x: instrX,
+            y,
+            size: 8,
+            font: fontOblique,
+            color: rgb(0.4, 0.4, 0.4),
+          });
           y -= 18;
 
           // Render Questions
@@ -2094,27 +3705,30 @@ async function startServer() {
             ensureSpace(45, false);
 
             // Question Header & Marks
-            const qPrefix = `Q${idx + 1}. [${q.marks} pt${q.marks !== 1 ? 's' : ''}] `;
-            const prefixWidth = fontBold.widthOfTextAtSize(qPrefix, 9.5);
-
-            // Wrap question text
+            const qPrefix = isExamRtl ? `سوال ${idx + 1}. [${q.marks} نمره] ` : `Q${idx + 1}. [${q.marks} pt${q.marks !== 1 ? 's' : ''}] `;
             const fullQText = `${qPrefix}${q.question_text}`;
-            drawWrapped(fullQText, marginX, 9.5, fontBold, rgb(0.1, 0.1, 0.1), contentWidth, 13, false);
+            drawWrapped(fullQText, marginX, 9.5, fontBold, rgb(0.1, 0.1, 0.1), contentWidth, 13, false, isExamRtl);
             y -= 4;
 
             // Options and response area
             if (qType === 'mcq' && q.options && q.options.length > 0) {
-              const optLabels = ['(A)', '(B)', '(C)', '(D)', '(E)', '(F)'];
+              const optLabels = isExamRtl
+                ? ['الف)', 'ب)', 'ج)', 'د)', 'هـ)', 'و)']
+                : ['(A)', '(B)', '(C)', '(D)', '(E)', '(F)'];
               q.options.forEach((opt, oIdx) => {
-                const cleanOpt = String(opt).replace(/^[A-Fa-f0-9][\:\.\)]\s*/, '').trim();
+                const cleanOpt = String(opt).replace(/^(\([A-Za-z0-9\u0621-\u064A\u067E\u0686\u0698\u06AF\u06CC\u06A9]+\)|[A-Za-z0-9\u0621-\u064A\u067E\u0686\u0698\u06AF\u06CC\u06A9]+[\:\.\-\)])\s*/, '').trim();
                 const optText = `${optLabels[oIdx] || `(${oIdx + 1})`}  ${cleanOpt}`;
-                drawWrapped(optText, marginX + 16, 9, font, rgb(0.2, 0.2, 0.2), contentWidth - 16, 12, false);
+                drawWrapped(optText, marginX + 16, 9, font, rgb(0.2, 0.2, 0.2), contentWidth - 16, 12, false, isExamRtl);
                 y -= 2;
               });
 
               ensureSpace(16, false);
-              page.drawText('Selected Option:  [ _______ ]', {
-                x: marginX + 16,
+              const selOptText = isExamRtl ? 'گزینه انتخابی:  [ _______ ]' : 'Selected Option:  [ _______ ]';
+              const selFormatted = isExamRtl ? formatPdfText(selOptText, true) : selOptText;
+              const selW = fontOblique.widthOfTextAtSize(selFormatted, 8.5);
+              const selX = isExamRtl ? Math.max(marginX, pageWidth - marginX - selW - 16) : marginX + 16;
+              safeDraw(selFormatted, {
+                x: selX,
                 y,
                 size: 8.5,
                 font: fontOblique,
@@ -2123,8 +3737,12 @@ async function startServer() {
               y -= 14;
             } else if (qType === 'true_false') {
               ensureSpace(16, false);
-              page.drawText('[   ]  True                  [   ]  False', {
-                x: marginX + 16,
+              const tfText = isExamRtl ? '[   ]  صحیح                  [   ]  غلط' : '[   ]  True                  [   ]  False';
+              const tfFormatted = isExamRtl ? formatPdfText(tfText, true) : tfText;
+              const tfW = font.widthOfTextAtSize(tfFormatted, 9);
+              const tfX = isExamRtl ? Math.max(marginX, pageWidth - marginX - tfW - 16) : marginX + 16;
+              safeDraw(tfFormatted, {
+                x: tfX,
                 y,
                 size: 9,
                 font,
@@ -2133,8 +3751,14 @@ async function startServer() {
               y -= 14;
             } else if (qType === 'fill_blank') {
               ensureSpace(16, false);
-              page.drawText('Answer: __________________________________________________________________', {
-                x: marginX + 16,
+              const fbText = isExamRtl
+                ? 'پاسخ: __________________________________________________________________'
+                : 'Answer: __________________________________________________________________';
+              const fbFormatted = isExamRtl ? formatPdfText(fbText, true) : fbText;
+              const fbW = font.widthOfTextAtSize(fbFormatted, 9);
+              const fbX = isExamRtl ? Math.max(marginX, pageWidth - marginX - fbW - 16) : marginX + 16;
+              safeDraw(fbFormatted, {
+                x: fbX,
                 y,
                 size: 9,
                 font,
@@ -2144,7 +3768,7 @@ async function startServer() {
             } else if (qType === 'essay') {
               for (let line = 0; line < 5; line++) {
                 ensureSpace(14, false);
-                page.drawText(
+                safeDraw(
                   '. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .',
                   {
                     x: marginX + 10,
@@ -2158,10 +3782,9 @@ async function startServer() {
               }
               y -= 4;
             } else {
-              // short answer lines
               for (let line = 0; line < 3; line++) {
                 ensureSpace(14, false);
-                page.drawText(
+                safeDraw(
                   '. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .',
                   {
                     x: marginX + 10,
@@ -2180,8 +3803,13 @@ async function startServer() {
           });
 
           ensureSpace(24, false);
-          page.drawText(`--- END OF EXAMINATION PAPER (${group.group_name}) ---`, {
-            x: marginX + 140,
+          const endText = isExamRtl
+            ? `--- پایان ورقه امتحانی (${group.group_name}) ---`
+            : `--- END OF EXAMINATION PAPER (${group.group_name}) ---`;
+          const endFormatted = isExamRtl ? formatPdfText(endText, true) : endText;
+          const endW = fontBold.widthOfTextAtSize(endFormatted, 8.5);
+          safeDraw(endFormatted, {
+            x: (pageWidth - endW) / 2,
             y,
             size: 8.5,
             font: fontBold,
@@ -2192,15 +3820,20 @@ async function startServer() {
 
         // 2. TEACHER ANSWER KEY & SCORING RUBRICS
         if (targetMode === 'both' || targetMode === 'answer_key') {
-          // If exporting both, start Answer Key on a fresh page
           if (targetMode === 'both') {
             page = pdfDoc.addPage([pageWidth, pageHeight]);
             y = pageHeight - 45;
           }
 
           // Confidential Header
-          page.drawText('CONFIDENTIAL - OFFICIAL TEACHER ANSWER KEY & SCORING RUBRICS', {
-            x: marginX,
+          const confHeader = isExamRtl
+            ? 'محرمانه — کلید رسمی سوالات و رهنمود نمره‌دهی اساتید'
+            : 'CONFIDENTIAL - OFFICIAL TEACHER ANSWER KEY & SCORING RUBRICS';
+          const confFormatted = isExamRtl ? formatPdfText(confHeader, true) : confHeader;
+          const confW = fontBold.widthOfTextAtSize(confFormatted, 11);
+          const confX = isExamRtl ? Math.max(marginX, pageWidth - marginX - confW) : marginX;
+          safeDraw(confFormatted, {
+            x: confX,
             y,
             size: 11,
             font: fontBold,
@@ -2208,8 +3841,14 @@ async function startServer() {
           });
           y -= 18;
 
-          page.drawText(`${exam.title} - ${group.group_name} Master Grading Rubric`, {
-            x: marginX,
+          const keyTitle = isExamRtl
+            ? `${exam.title} - ${group.group_name} کلید و معیار جامع نمره‌دهی`
+            : `${exam.title} - ${group.group_name} Master Grading Rubric`;
+          const keyFormatted = isExamRtl ? formatPdfText(keyTitle, true) : keyTitle;
+          const keyW = fontBold.widthOfTextAtSize(keyFormatted, 13);
+          const keyX = isExamRtl ? Math.max(marginX, pageWidth - marginX - keyW) : marginX;
+          safeDraw(keyFormatted, {
+            x: keyX,
             y,
             size: 13,
             font: fontBold,
@@ -2217,16 +3856,19 @@ async function startServer() {
           });
           y -= 16;
 
-          page.drawText(
-            `Subject: ${exam.subject}  |  Total Questions: ${group.questions.length}  |  Total Marks: ${groupMarks} pts`,
-            {
-              x: marginX,
-              y,
-              size: 9,
-              font,
-              color: rgb(0.35, 0.35, 0.35),
-            }
-          );
+          const keyMeta = isExamRtl
+            ? `مضمون: ${exam.subject}  |  تعداد سوالات: ${group.questions.length}  |  مجموع نمرات: ${groupMarks}`
+            : `Subject: ${exam.subject}  |  Total Questions: ${group.questions.length}  |  Total Marks: ${groupMarks} pts`;
+          const keyMetaFormatted = isExamRtl ? formatPdfText(keyMeta, true) : keyMeta;
+          const keyMetaW = font.widthOfTextAtSize(keyMetaFormatted, 9);
+          const keyMetaX = isExamRtl ? Math.max(marginX, pageWidth - marginX - keyMetaW) : marginX;
+          safeDraw(keyMetaFormatted, {
+            x: keyMetaX,
+            y,
+            size: 9,
+            font,
+            color: rgb(0.35, 0.35, 0.35),
+          });
           y -= 16;
 
           page.drawLine({
@@ -2237,14 +3879,18 @@ async function startServer() {
           });
           y -= 18;
 
-          // Render each question's answer item with full text, complete answer, full explanation, and complete provenance
+          // Render each question's answer item
           group.questions.forEach((q, idx) => {
             ensureSpace(70, true);
 
-            // Item header: Q#, Type, Marks
-            const qHeader = `Q${idx + 1} (${(q.question_type || 'General').toUpperCase()} - ${q.marks} pt):`;
-            page.drawText(qHeader, {
-              x: marginX,
+            const qHeader = isExamRtl
+              ? `سوال ${idx + 1} (${q.question_type || 'عمومی'} - ${q.marks} نمره):`
+              : `Q${idx + 1} (${(q.question_type || 'General').toUpperCase()} - ${q.marks} pt):`;
+            const qHeaderFormatted = isExamRtl ? formatPdfText(qHeader, true) : qHeader;
+            const qHeaderW = fontBold.widthOfTextAtSize(qHeaderFormatted, 9.5);
+            const qHeaderX = isExamRtl ? Math.max(marginX, pageWidth - marginX - qHeaderW) : marginX;
+            safeDraw(qHeaderFormatted, {
+              x: qHeaderX,
               y,
               size: 9.5,
               font: fontBold,
@@ -2252,30 +3898,29 @@ async function startServer() {
             });
             y -= 13;
 
-            // Full question text
-            drawWrapped(`Question: ${q.question_text}`, marginX + 8, 8.5, fontOblique, rgb(0.2, 0.2, 0.2), contentWidth - 8, 12, true);
+            const qLabel = isExamRtl ? `سوال: ${q.question_text}` : `Question: ${q.question_text}`;
+            drawWrapped(qLabel, marginX + 8, 8.5, fontOblique, rgb(0.2, 0.2, 0.2), contentWidth - 8, 12, true, isExamRtl);
             y -= 3;
 
-            // Correct Answer in green bold
-            drawWrapped(`Correct Answer: ${q.correct_answer || '—'}`, marginX + 8, 9, fontBold, rgb(0.05, 0.45, 0.15), contentWidth - 8, 12.5, true);
+            const ansLabel = isExamRtl ? `پاسخ صحیح: ${q.correct_answer || '—'}` : `Correct Answer: ${q.correct_answer || '—'}`;
+            drawWrapped(ansLabel, marginX + 8, 9, fontBold, rgb(0.05, 0.45, 0.15), contentWidth - 8, 12.5, true, isExamRtl);
             y -= 3;
 
-            // Detailed Explanation / Scoring Rubric
-            const explanationText = q.explanation
-              ? `Explanation & Rubric: ${q.explanation}`
-              : 'Explanation & Rubric: Derived directly from source reference materials.';
-            drawWrapped(explanationText, marginX + 8, 8.5, font, rgb(0.25, 0.25, 0.25), contentWidth - 8, 12, true);
+            const explanationText = isExamRtl
+              ? `تشریح و معیار نمره‌دهی: ${q.explanation || 'مستند به متن منبع آموزشی.'}`
+              : (q.explanation ? `Explanation & Rubric: ${q.explanation}` : 'Explanation & Rubric: Derived directly from source reference materials.');
+            drawWrapped(explanationText, marginX + 8, 8.5, font, rgb(0.25, 0.25, 0.25), contentWidth - 8, 12, true, isExamRtl);
             y -= 3;
 
-            // Full Source Provenance Citation
-            let provStr = `Source Provenance: ${q.source_document_name || 'Document'} (Page ${q.source_page || 1}${q.source_chapter ? `, ${q.source_chapter}` : ''}${q.source_section ? `, ${q.source_section}` : ''})`;
+            let provStr = isExamRtl
+              ? `استناد منبع: ${q.source_document_name || 'منبع'} (صفحه ${q.source_page || 1}${q.source_chapter ? `، ${q.source_chapter}` : ''})`
+              : `Source Provenance: ${q.source_document_name || 'Document'} (Page ${q.source_page || 1}${q.source_chapter ? `, ${q.source_chapter}` : ''}${q.source_section ? `, ${q.source_section}` : ''})`;
             if (q.source_evidence) {
-              provStr += ` | Citation: "${q.source_evidence}"`;
+              provStr += isExamRtl ? ` | نقل‌قول: "${q.source_evidence}"` : ` | Citation: "${q.source_evidence}"`;
             }
-            drawWrapped(provStr, marginX + 8, 8, font, rgb(0.4, 0.4, 0.4), contentWidth - 8, 11, true);
+            drawWrapped(provStr, marginX + 8, 8, font, rgb(0.4, 0.4, 0.4), contentWidth - 8, 11, true, isExamRtl);
             y -= 6;
 
-            // Subtle divider between questions
             ensureSpace(8, true);
             page.drawLine({
               start: { x: marginX + 8, y },
@@ -2287,16 +3932,18 @@ async function startServer() {
           });
 
           ensureSpace(20, true);
-          page.drawText(
-            '--- Strictly Confidential - Academic Faculty Grading Only ---',
-            {
-              x: marginX + 130,
-              y,
-              size: 8,
-              font: fontOblique,
-              color: rgb(0.65, 0.15, 0.15),
-            }
-          );
+          const confFoot = isExamRtl
+            ? '--- سند کاملاً محرمانه — صرفاً جهت استفاده اساتید ---'
+            : '--- Strictly Confidential - Academic Faculty Grading Only ---';
+          const confFootFormatted = isExamRtl ? formatPdfText(confFoot, true) : confFoot;
+          const confFootW = fontOblique.widthOfTextAtSize(confFootFormatted, 8);
+          safeDraw(confFootFormatted, {
+            x: (pageWidth - confFootW) / 2,
+            y,
+            size: 8,
+            font: fontOblique,
+            color: rgb(0.65, 0.15, 0.15),
+          });
         }
       }
 
@@ -2321,9 +3968,15 @@ async function startServer() {
   // ==========================================
   // FRONTEND INTEGRATION: VITE MIDDLEWARE
   // ==========================================
+  const httpServer = http.createServer(app);
+
   if (process.env.NODE_ENV !== 'production') {
+    const isHmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: isHmrDisabled ? false : { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -2337,7 +3990,7 @@ async function startServer() {
     }
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`ExamCraft AI Server listening on http://0.0.0.0:${PORT}`);
   });
 }

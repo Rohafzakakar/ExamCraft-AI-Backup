@@ -44,28 +44,15 @@ export function AcademicPaperPreview({
       ? exam.groups
       : [exam.groups[activeGroupIndex] || exam.groups[0]].filter(Boolean);
 
-  const handlePrint = async () => {
-    // 1. Ensure all custom and web fonts are loaded before opening print dialog
-    if (typeof document !== 'undefined' && document.fonts && document.fonts.ready) {
-      try {
-        await document.fonts.ready;
-      } catch {
-        // Continue if font promise fails
+  const handlePrint = () => {
+    try {
+      if (typeof window !== 'undefined') {
+        window.focus();
+        window.print();
       }
+    } catch (err) {
+      console.error('Print dialog invocation error:', err);
     }
-
-    // 2. Ensure React DOM updates and style recalcs have painted before opening print dialog
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        setTimeout(() => {
-          try {
-            window.print();
-          } catch (err) {
-            console.error('Print dialog error:', err);
-          }
-        }, 100);
-      });
-    });
   };
 
   return (
@@ -161,8 +148,11 @@ export function AcademicPaperPreview({
 
           {/* Print Button */}
           <button
+            type="button"
+            data-testid="print-sheet-btn"
             onClick={handlePrint}
             className="px-3 py-1.5 rounded-xl border border-stone-200 text-stone-700 hover:bg-stone-50 font-bold text-xs flex items-center gap-1.5 cursor-pointer shadow-xs"
+            title="Print Examination Sheets & Answer Keys"
           >
             <Printer className="w-3.5 h-3.5 text-stone-600" />
             <span>Print Sheet</span>
@@ -230,9 +220,19 @@ export function AcademicPaperPreview({
                 >
                   {/* Institutional Header */}
                   <div className="text-center space-y-1 border-b border-stone-200 pb-4">
-                    <h2 className="text-base font-bold tracking-wide uppercase text-stone-800">
-                      {exam.institution || 'ACADEMIC INSTITUTION'}
-                    </h2>
+                    {(() => {
+                      const instParts = [exam.institution, exam.faculty]
+                        .filter(Boolean)
+                        .map((s) => String(s).trim())
+                        .filter(Boolean);
+                      const instHeader = instParts.join(' — ');
+                      if (!instHeader) return null;
+                      return (
+                        <h2 className="text-base font-bold tracking-wide uppercase text-stone-800">
+                          {instHeader}
+                        </h2>
+                      );
+                    })()}
                     <h1 className="text-xl font-black text-stone-950 font-sans tracking-tight">
                       {exam.title}
                     </h1>
